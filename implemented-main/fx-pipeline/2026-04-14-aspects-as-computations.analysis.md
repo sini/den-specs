@@ -2,11 +2,11 @@
 
 ## Verdict
 
-**Substantially implemented, with divergence in naming and structure.** The core thesis — aspects compile to effect types, handlers own resolution strategy — is fully realized. The specific API surface (function names, effect names, handler decomposition) diverged during implementation, but the semantic model is intact and operational on `feat/fx-pipeline`.
+**Substantially implemented, with divergence in naming and structure.** The core thesis — aspects compile to effect types, handlers own resolution strategy — is fully realized. The specific API surface (function names, effect names, handler decomposition) diverged during implementation, but the semantic model is intact and operational on `main` (since `68c26555`) and extended further on `feat/fx-pipeline`.
 
 ## Delivery Target
 
-`feat/fx-pipeline` (current branch). Not on `main`. The spec targeted `feat/fx-resolution`, which was absorbed into the pipeline branch.
+`main` — core landed in `68c26555` ("refactor: den-fx (#462)"), which squash-merged `feat/fx-resolution` into main on 2026-04-17. `aspectToEffect`, all three effect types, `includeHandler`, and `constraintRegistryHandler` are all present on main. `feat/fx-pipeline` builds on top with post-spec additions (traits, policies, forward, provides-compat). The spec targeted `feat/fx-resolution`, which became the squash merge `68c26555`.
 
 ## Evidence
 
@@ -71,3 +71,11 @@ The spec proposed exporting `{ resolveAspect, resolveIncludeHandler }` as a pair
 **Handler decomposition diverged.** Spec proposed a single `resolveIncludeHandler` in `resolveDeepEffectful`. Implementation splits into `includeHandler` (emit-include dispatch) in a separate file, composited statically into `defaultHandlers`. The recursive reference to `aspectToEffect` is resolved via the module fixpoint, not via a factory closure.
 
 **Additional handlers added.** `defaultHandlers` includes `traitArgHandler`, `traitCollectorHandler`, `registerAspectPolicyHandler`, `dispatchPolicyIncludesHandler`, `deferredIncludeHandler`, `drainDeferredHandler`, `resolveEntityHandler`, `forwardHandler`, `provideToHandler` — none present in the spec. These reflect post-spec feature additions (traits, policies, provides-compat, forward post-processing) rather than spec violations.
+
+## Cross-Reference Notes
+
+- **Corrected:** The original Delivery Target said "feat/fx-pipeline (current branch). Not on main." This was wrong. The core (`aspectToEffect`, all three effect types, `includeHandler`, `constraintRegistryHandler`) landed in `68c26555` on main. Confirmed by `git show main:nix/lib/aspects/fx/aspect.nix`. The spec targeted `feat/fx-resolution`, which was squash-merged as `68c26555`.
+- **Corrected:** The original Verdict referred to "operational on feat/fx-pipeline" — updated to "operational on main (since 68c26555) and extended further on feat/fx-pipeline".
+- The 2026-04-13-fx-resolution-prototype analysis covers the same implementation from a different angle; its Delivery Target correctly says "main — landed in refactor: den-fx (#462)".
+- The 2026-04-14-unified-effects-pipeline analysis provides comprehensive evidence that all spec items landed in `68c26555` on main — fully corroborates the corrected delivery target here.
+- The 2026-04-14-effectful-handlers analysis (for the nix-effects fork changes) correctly cites main-compatible delivery, consistent with the correction here.

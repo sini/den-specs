@@ -96,3 +96,11 @@ Added beyond spec (compat shim approach):
 - Spec's `find-mutual` guard for name collision (Step 2 risk mitigation) not implemented — not needed since mutual-provider was replaced with policies
 - `resolveChildren` bind chain has `emitSelfProvide` + `emitCrossProvideShims` both running — spec envisioned removing `emitSelfProvide` entirely; the shim adds a parallel path instead
 - `_` alias removal blocked on `provides` option removal (Step 5), which is blocked on template migration completing
+
+## Cross-Reference Notes
+
+Cross-referenced 2026-04-28 against `2026-04-26-pipeline-simplification-targets.analysis.md` and `2026-04-26-pipeline-simplification-design.analysis.md`.
+
+- **Prerequisite status**: The pipeline-simplification targets analysis previously listed "entityProvides removal (direct-ref-aspects Task 4)" as an incomplete gating prerequisite for Target 1. This was incorrect. The design analysis confirms entityIncludes/entityProvides were already deleted on this branch (commits `9a338b50`, `973ac30b`). The gating blocker for provides deletion is template migration (~114 occurrences), consistent with what this analysis documents.
+- **Consistent with design analysis**: This file's status (all deletion steps pending, compat shim added, 114 template occurrences remaining) matches the pipeline-simplification design analysis Target 1 section exactly.
+- **Host-aspects battery**: Not relevant to this spec. The host-aspects battery (main + feat/fx-pipeline) is a separate self-contained feature with no dependency on provides removal progress.

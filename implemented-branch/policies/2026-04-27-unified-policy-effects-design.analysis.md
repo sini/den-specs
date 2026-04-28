@@ -95,3 +95,9 @@ Supersedes the field-based `policyType` submodule from `nix/nixModule/policies.n
 - **`provides` compat shim.** Spec describes `provides` structural key as fully replaced. Implementation added a backward-compat shim (`provides-compat.nix`) that translates old `provides.X` to `policy.include` effects at runtime with deprecation warnings. This is a compatibility layer beyond the spec's clean-cut migration.
 
 - **`den.lib.policy` exposure path.** Spec says "provided via `den.lib.policy`." Confirmed: `nix/lib/default.nix` line 31 maps `policy = ./policy-effects.nix`. Used in `home-env.nix` and `provides-compat.nix` as `den.lib.policy.resolve` / `den.lib.policy.include`. Consistent.
+
+## Cross-Reference Notes
+
+- **Consumed by pipeline-simplification spec**: `2026-04-28-policy-pipeline-simplification.analysis.md` declares this spec as a prerequisite that is "fully consumed." The three effect constructors, `__policyEffect` dispatch, and plain-function shape established here are the foundation the pipeline-simplification spec built on. The pipeline-simplification analysis treats Phases A–E as complete; this spec covers Phase A (effects model) through Phase D (aspect-included policies).
+- **Supersession chain**: This spec sits between the effectful-bootstrap approach (which was abandoned — see `2026-04-23-effectful-pipeline-bootstrap-design.analysis.md`) and the pipeline-simplification (which completed the cleanup). The "NOT IMPLEMENTED" bootstrap spec and this spec were parallel explorations; the plain-function path taken here made the bootstrap spec moot.
+- **`scope.provide` position**: This spec does not claim `scope.provide` is used for policy dispatch, which is correct. The only `scope.provide` in the codebase is `aspect.nix:915` for parametric context propagation via `__scopeHandlers`. Policy dispatch uses direct iteration only.

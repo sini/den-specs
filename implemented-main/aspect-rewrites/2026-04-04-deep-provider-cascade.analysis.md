@@ -39,7 +39,9 @@ Core features still exist but the surface API has changed significantly:
 
 ## Supersession
 
-This spec was partially superseded by the fx-pipeline architecture (feat/fx-pipeline). The spec's `transforms.nix`-based approach (pure functions applied to `{ provided, ... }`) was replaced by algebraic effects with a constraint registry. Key replacements:
+This spec extended and partially superseded `2026-04-04-provider-aware-excludes.md`, which introduced single-level prefix cascade for `excludeAspect`. This spec added `listOf str` provider paths, deep/nested cascade, provider-aware substitute, and namespace qualification on top of that foundation.
+
+This spec was then partially superseded by the fx-pipeline architecture (feat/fx-pipeline). The spec's `transforms.nix`-based approach (pure functions applied to `{ provided, ... }`) was replaced by algebraic effects with a constraint registry. Key replacements:
 
 - `aspects/transforms.nix` → `aspects/fx/constraints.nix` (exclude/substitute as effect records) + `aspects/fx/handlers/tree.nix` (constraint registry with prefix cascade)
 - `aspects/resolve.nix` trace → `aspects/fx/trace.nix` (structuredTraceHandler)
@@ -66,3 +68,9 @@ The spec's "known asymmetry" about ctxApply string matching was resolved by dele
 3. **Cascade scope** — spec's isPrefix cascade applies at the aspect resolution level (transform layer). Current implementation applies cascade in the constraint registry check (`check-constraint` in `tree.nix`) by splitting the pathKey string on "/" and looking up all ancestor prefixes. Functionally equivalent but implemented one level deeper in the effect handler.
 
 4. **`compose` / `normalizeResult`** — spec notes breaking changes removing these. They are fully absent; no trace.
+
+## Cross-Reference Notes
+
+- **Supersession chain**: `2026-04-04-provider-aware-excludes.md` (single-level prefix cascade, verdict: implemented) → this spec (deep/nested cascade, `listOf str` provider paths, provider-aware substitute; verdict: partially-implemented) → fx-pipeline architecture (constraint registry in `tree.nix`/`transition.nix`). The `provider-aware-excludes` analysis correctly identifies this spec as its partial supersessor.
+- **Consistent with `aspect-transforms-spec` analysis**: both note `transforms.nix` never existed as a real file; both confirm `adapters.nix` deleted in `3a9cea99`.
+- **Consistent with `provider-aware-excludes` analysis**: both agree `__provider` was never a declared NixOS option; both agree `meta.provider` is the implementation mechanism; both agree cascade semantics are preserved in the fx pipeline via string prefix decomposition in `tree.nix`.

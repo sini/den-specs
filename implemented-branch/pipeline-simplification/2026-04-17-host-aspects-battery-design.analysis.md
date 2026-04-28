@@ -41,3 +41,10 @@ Minor implementation drift from spec pseudocode — all intentional and sound:
 | `parametric.fixedTo { host, user } host.aspect` | `constantHandler ctx` injected as `__scopeHandlers` — same semantics, new API |
 | Resolves only `"homeManager"` class | Resolves all `user.classes` (defaults to `["homeManager"]`) |
 | 4 tests specified | 9 tests implemented (extra: no-duplication, shared-sub-aspects, overlap-no-conflict, multi-user-distinct, hjem class) |
+
+## Cross-Reference Notes
+
+Cross-referenced 2026-04-28 against pipeline-simplification targets, design, and provides-removal analyses.
+
+- **No inconsistencies found.** This battery is a self-contained feature with no dependency on provides removal or the pipeline simplification targets. Status (shipped, live on main and feat/fx-pipeline) is not contradicted by any other analysis.
+- **Not a pipeline simplification target.** The six pipeline simplification targets (provides API, collision detection, sub-pipeline, classifyKeys, fan-out, child shapes) do not include host-aspects. The battery's presence on both branches is independent of that work.

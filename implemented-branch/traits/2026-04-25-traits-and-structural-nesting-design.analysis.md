@@ -40,9 +40,10 @@ Branch `feat/fx-pipeline`. No separate traits branch — landed incrementally vi
 - `partialOk` post-pipeline validation (lines 286–293, 345–346): errors when pipeline-time consumer saw trait AND Tier 3 deferred emissions exist, unless `partialOk = true`.
 
 **`wrapClassModule` trait arg pre-application (Phase 3):**
-- `nix/lib/aspects/types.nix` lines 166–262: `traitArgNames` extracted after den context args.
-- Trait thunks: `moduleArgs: moduleArgs.config._den.traits.${name} or []` — lazy, resolved at `evalModules` time.
+- `nix/lib/aspects/fx/aspect.nix` lines 97–269: `traitArgNames` extracted after den context args (line 166).
+- Trait thunks: `moduleArgs: moduleArgs.config._den.traits.${name} or []` — lazy, resolved at `evalModules` time (lines 217–218).
 - Den context args take priority (checked first); trait args only for names not already in `ctx`.
+- Note: `nix/lib/aspects/types.nix` lines 166–262 are the `providerType.merge` dispatch table (parametric merge), not `wrapClassModule`.
 
 **Cross-entity trait distribution (Phase 4):**
 - `nix/lib/aspects/fx/distribute-cross-entity.nix` implements `distributeCrossEntityTraits` — groups by target name, merges with collection strategy.
@@ -108,3 +109,13 @@ Supersedes the 2026-04-16 Capabilities spec (draft) as stated in the spec header
 2. **`provide-to` effect payload.** The spec §Provide-To Unification specifies changing the `"provide-to"` effect payload from "raw labeled data to trait state." This is implemented: `transition.nix` now emits `{ targetEntity, traits }` (trait state). The `provide-to.nix` handler accumulates these trait-carrying payloads. Consistent with spec intent.
 
 3. **`aspectKeyType` three-branch dispatch.** The spec describes `aspectContentType` as a uniform wrapper applied identically to all keys, with classification deferred to `compileStatic`. The implementation uses `aspectKeyType` which does per-key registry lookups at type-merge time (commit `e790dc8e`). This is a minor structural deviation — classification happens slightly earlier (at type merge rather than purely at `compileStatic`) but the semantic result is the same. `compileStatic` still does the authoritative 4-step classification.
+
+## Cross-Reference Notes
+
+- **`wrapClassModule` file corrected:** Evidence section previously cited `nix/lib/aspects/types.nix` lines 166–262. Actual location is `nix/lib/aspects/fx/aspect.nix` lines 97–269. Lines 166–262 of `types.nix` are `providerType.merge` (parametric merge dispatch from the class-emission-dedup spec). Cross-confirmed against `2026-04-24-class-module-partial-apply-design.analysis.md` which correctly cites `aspect.nix:97–269`.
+
+- **Unregistered key trace warning bug:** The `builtins.seq (map ...) null` pattern at `aspect.nix:842-845` does not fire traces — `builtins.seq` forces the list spine but not element thunks. This latent bug is documented in `2026-04-25-traits-branch-review-findings.analysis.md` (Item 1) and confirmed unresolved. The structural detection section correctly states traces are emitted for unregistered keys in the 4-step description; the gap is in execution, not code presence.
+
+- **Supersession chain:** Stages elimination (`2026-04-25-eliminate-stages-design.analysis.md`) feeds directly into this spec. `entityIncludes` was an intermediate introduced on feat/traits, then deleted (`9a338b50`); settled interface is `den.schema.<kind>.includes`. No inconsistency with this analysis (traits analysis does not reference `entityIncludes`).
+
+- **Class-module partial apply:** `2026-04-24-class-module-partial-apply-design.analysis.md` documents trait consumption in class modules (Drift item 2, commit `28118e46`) as a scope extension beyond that spec. This aligns with Phase 3 description here — trait thunks in `wrapClassModule` postdate the partial-apply spec and were introduced as part of the traits work.

@@ -58,3 +58,9 @@ The spec's design assumed:
 - Bootstrap involves pre-computing `mergedInto` outside fx.handle — FALSE, that code path was deleted entirely rather than moved
 
 The current architecture replaces static stage-based routing with dynamic entity-kind resolution (`resolve-entity`) and schema-driven includes. The spec's Layer 2 goal (per-policy named handlers for peer queries) remains unbuilt and would require a new design compatible with plain-function policies.
+
+## Cross-Reference Notes
+
+- **Consistent with all policies analyses**: This "NOT IMPLEMENTED" verdict is confirmed independently by `2026-04-20-policies-design.analysis.md` ("no named effect per policy"), the simplified-review-guide legacy-removal analysis ("resolve-policy / resolve-target effects: Not present"), and `2026-04-28-policy-pipeline-simplification.analysis.md` (direct iteration dispatch with no named bootstrap effects). No analysis contradicts this.
+- **Supersession chain position**: This spec sat between the `from/to` submodule design (`2026-04-20-policies-design.md`) and the plain-function simplification path (`2026-04-27-unified-policy-effects-design.md`). The simplification path was chosen instead — the `den.stages` removal and `policy-dispatch.nix` deletion made the bootstrap approach structurally impossible before it could be built.
+- **`scope.provide` clarification**: The spec proposed `scope.provide` per-policy for named handler injection (Layer 2). This never shipped. The only `scope.provide` in the codebase is `aspect.nix:915` for parametric context (`__scopeHandlers`), unrelated to policy dispatch. See `2026-04-19-provide-to-effects-design.analysis.md` Cross-Reference Notes for full account.

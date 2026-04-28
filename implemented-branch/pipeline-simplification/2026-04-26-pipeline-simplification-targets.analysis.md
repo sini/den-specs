@@ -10,7 +10,7 @@ Spec date: 2026-04-26. Analysis date: 2026-04-28. Branch: feat/fx-pipeline.
 NOT STARTED — live code, compat shim ADDED
 
 ### Delivery Target
-Unscheduled. Requires direct-ref-aspects Task 4 (entityProvides removal) as prerequisite — that task is not yet complete.
+Unscheduled. The previously cited prerequisite (direct-ref-aspects Task 4: entityProvides removal) is already complete — `entityIncludes`/`entityProvides` were deleted in commits `9a338b50` and `973ac30b` on this branch. The actual gating blocker is template migration (114 remaining `provides.X` occurrences across ~30 files) plus compat shim removal.
 
 ### Evidence
 - `emitSelfProvide` present in `nix/lib/aspects/fx/aspect.nix` (line 687, called at line 760)
@@ -18,15 +18,16 @@ Unscheduled. Requires direct-ref-aspects Task 4 (entityProvides removal) as prer
 - `emitCrossProvider` present in `nix/lib/aspects/fx/handlers/transition.nix` (line 101, called at line 287)
 - NEW: `nix/lib/aspects/fx/handlers/provides-compat.nix` added AFTER spec was written — a compat shim for main-era `provides.X` cross-provide patterns. Commits: `c52a3779`, `2e40b024`
 - The provides-compat shim emits deprecation warnings and re-routes to `policy.include`, but does NOT remove the underlying `emitSelfProvide` / `emitCrossProvider` infrastructure
+- `entityIncludes`/`entityProvides` already deleted (commits `9a338b50`, `973ac30b`); `rootIncludes` already deleted (commit `973ac30b`)
 
 ### Current Status
-The spec's prerequisite (entityProvides removal) is incomplete. The branch has moved in the opposite direction for compat: a new handler was added to preserve cross-provide behavior during a migration period. `emitSelfProvide` and `emitCrossProvider` remain fully live.
+The branch has moved in the opposite direction for compat: a new handler was added to preserve cross-provide behavior during a migration period. `emitSelfProvide` and `emitCrossProvider` remain fully live. The prerequisite entityProvides deletion is complete; the actual blocker is ~114 template occurrences of `provides.X` that must be migrated before machinery can be removed.
 
 ### Supersession
-None. The spec's migration path is intact — the compat shim is step 1 of the migration (audit + deprecation trace). The spec's step 2 onwards (remove emitSelfProvide, emitCrossProvider, mkPositionalInclude, mkNamedInclude, rootIncludes) has not begun.
+None. The spec's migration path is intact — the compat shim is step 1 of the migration (audit + deprecation trace). The spec's step 2 onwards (remove emitSelfProvide, emitCrossProvider, mkPositionalInclude, mkNamedInclude) has not begun.
 
 ### Gaps
-- `entityProvides` removal (direct-ref-aspects Task 4) is the gating prerequisite and is not done
+- Template migration: ~114 `provides.X` occurrences across ~30 files remain unmigrated (actual gating prerequisite)
 - The compat shim references in provides-compat.nix mirror `emitSelfProvide`'s shape detection (comment at line 18) — this coupling will need to be severed when the shim outlives the original
 
 ### Drift
@@ -192,4 +193,12 @@ Mutual-provider removal (commit `11625e47`) and forward-as-post-processing (comm
 | 5: Generalize flake fan-out | COMPLETE | isolateFanOut property derived from resolve.shared |
 | 6: Child shape normalization | NOT STARTED | Blocked on Target 2; internal factory scope reduced |
 
-Recommended order from spec: Targets 3 and 5 are the "immediate wins" — both are now done. Next in spec order: Target 1 (blocked on prerequisite), then Target 4, then Target 2, then Target 6.
+Recommended order from spec: Targets 3 and 5 are the "immediate wins" — both are now done. Next in spec order: Target 1 (blocked on template migration), then Target 4, then Target 2, then Target 6.
+
+## Cross-Reference Notes
+
+Cross-referenced 2026-04-28 against `2026-04-26-pipeline-simplification-design.analysis.md` and `2026-04-26-provides-removal-design.analysis.md`.
+
+- **Target 1 prerequisite corrected**: This file previously stated "direct-ref-aspects Task 4 (entityProvides removal) is the gating prerequisite and is not done." This was incorrect. The design analysis documents that `entityIncludes`/`entityProvides` were deleted in commits `9a338b50` and `973ac30b`, and `rootIncludes` in `973ac30b`. The actual gating blocker is template migration (~114 remaining `provides.X` occurrences) as confirmed by the provides-removal analysis.
+- **Design analysis consistency**: The design analysis (Target 1 section) and this file now agree: Steps 1–4 complete, compat shim added, underlying machinery still present, template migration not started.
+- **Provides-removal analysis consistency**: The provides-removal analysis independently confirms 114 template occurrences remain and all deletion steps (emitSelfProvide, emitCrossProvider, provides option, structuralKeysSet) are not done — consistent with this file's NOT STARTED verdict.

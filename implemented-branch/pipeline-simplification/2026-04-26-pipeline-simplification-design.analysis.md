@@ -94,3 +94,11 @@ The `provides-removal` spec referenced in git history (`e865a331`) likely captur
 | Target 5: isolateFanOut in policy-types.nix | Declared mkOption | Derived inline from __shared flag; no option declaration |
 | Target 5: set isolateFanOut = true on flake policies | Explicit set | Flake policies use resolve.to (isolated by default); no explicit field |
 | runSubPipeline returns { imports, traits, provideTo } | Plain record | Returns { classImports, traits, provideTo }; classImports is multi-class map, not flat imports list |
+
+## Cross-Reference Notes
+
+Cross-referenced 2026-04-28 against `2026-04-26-pipeline-simplification-targets.analysis.md` and `2026-04-26-provides-removal-design.analysis.md`.
+
+- **Target 1 prerequisite clarification**: The targets analysis previously cited "entityProvides removal" as an incomplete gating prerequisite. That was a misattribution — this file correctly documents entityIncludes/entityProvides as already deleted (commits `9a338b50`, `973ac30b`). The targets analysis has been corrected; the actual gating blocker is template migration (~114 occurrences).
+- **Provides-removal consistency**: This file's Target 1 status ("partially complete — Steps 1–4 done, compat shim added, Steps 5–6 deferred") is consistent with the provides-removal analysis which independently confirms all deletion steps pending and 114 template occurrences remaining.
+- **Targets summary table consistency**: After correction, both files agree: Target 1 NOT STARTED (deletion), Target 3 COMPLETE, Target 4 PARTIAL, Target 5 COMPLETE, Targets 2 and 6 NOT STARTED.

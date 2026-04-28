@@ -53,7 +53,7 @@ Pipeline fully operational on `feat/fx-pipeline`. The spec's replacement goal is
 - `can-take.nix` — retained; `isSubmoduleFn` still uses `canTake.upTo` for NixOS module detection (not the same use case spec was eliminating)
 - `parametric.nix` — retained as deprecated shim wrapping `__scopeHandlers`
 - `statics.nix` — does not exist in current tree; folded into handler as spec planned
-- `aspects/adapters.nix` — does not exist; adapter pattern replaced by constraint system (`meta.handleWith`, `meta.excludes`)
+- `aspects/adapters.nix` — still exists on `main` as legacy-only shim (marked "Legacy pipeline only — GOF adapters for resolve.withAdapter. Remove when the legacy pipeline is removed."); deleted on `feat/fx-pipeline` in `3a9cea99`. Not replaced by a new fx-specific adapters.nix — the constraint system (`meta.handleWith`, `meta.excludes`) serves that role instead.
 - `ctx-apply.nix` — does not exist; context stages replaced by `into-transition` handler + `scope.provide`
 - `coercedProviderType` — still exists in `nix/lib/aspects/types.nix:436` but scoped to a narrow case (parametric fn coercion to `{ includes = [fn]; }` so `bind.fn` can resolve it — different from spec's "not needed" claim)
 
@@ -95,3 +95,10 @@ Subsequent specs built on this foundation:
 5. **File plan fidelity** — spec's file deletion plan (`take.nix`, `can-take.nix`, `parametric.nix` deleted) was not fully executed; they remain as deprecated shims for backward compat. The core algorithmic replacement happened; the file cleanup was deferred.
 
 6. **`coercedProviderType` retained** — spec said "gone". It survived in a narrower role: coercing bare parametric functions into `{ includes = [fn]; }` so `bind.fn` can resolve them inside the pipeline. The bug-prone coercion use cases (factory function detection, `functionArgs` guessing) were eliminated; this residual coercion is clean.
+
+## Cross-Reference Notes
+
+- **Corrected:** The original analysis listed "aspects/adapters.nix — does not exist" in the Legacy files status section. This was incorrect. `adapters.nix` exists on `main` as a legacy-only shim (marked "Legacy pipeline only — GOF adapters for resolve.withAdapter. Remove when legacy pipeline is removed."). It was deleted on `feat/fx-pipeline` in commit `3a9cea99`. The 2026-04-13-fx-adapters-spec analysis correctly documents both states.
+- The supersession chain from this spec flows forward to traits (`2026-04-25`), unified policy effects (`2026-04-27`), and policy pipeline simplification (`2026-04-28`), as documented in the Supersession section.
+- The 2026-04-13-fx-resolution-prototype analysis corroborates this spec's core findings. Both confirm `aspectToEffect`, handler-owned recursion, and the same effect protocol.
+- The 2026-04-14-unified-effects-pipeline analysis provides the most detailed post-implementation view of exactly what landed in `68c26555`; its evidence section cross-validates the claims here.
