@@ -2,7 +2,9 @@
 
 **Date:** 2026-04-28
 **Branch:** feat/fx-pipeline
-**Status:** Draft
+**Status:** Implemented
+
+Shipped on `feat/fx-pipeline` (commits 19738452..2e40b024). Pipeline handler `provides-compat.nix` and mutual-provider shim both landed.
 **Prerequisite for:** Provides removal (2026-04-27-provides-removal-post-unified-effects.md)
 
 ## Problem

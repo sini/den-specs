@@ -1,6 +1,8 @@
 # Unified Policy Effects Design
 
-## Status: Approved
+## Status: Implemented
+
+Shipped on `feat/fx-pipeline` across Phases A-E. All policies are plain functions returning typed effects. `policyFns→policies` rename, `resolve.to` API, `__functor` removal all landed.
 
 ## Core Insight
 

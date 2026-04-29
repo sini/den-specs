@@ -1,6 +1,6 @@
 # Den Spec Implementation Audit — Executive Summary
 
-Generated: 2026-04-28. Branch under review: `feat/fx-pipeline` (169+ commits ahead of main).
+Generated: 2026-04-28, updated 2026-04-29. Branch under review: `feat/fx-pipeline`.
 
 ---
 
@@ -40,6 +40,12 @@ Generated: 2026-04-28. Branch under review: `feat/fx-pipeline` (169+ commits ahe
 | 2026-04-23-forward-as-handler-design | policies | implemented | branch | `emit-forward` effect and `forwardHandler` shipped; sub-pipeline deferred to post-processing | Forward-as-handler landed; `1c077a06` refined inline execution to deferred post-processing |
 | 2026-04-27-unified-policy-effects-design | policies | partially-implemented | branch | Three effect types, dispatch, aspect-included policies, traits — all shipped; `corePolicies` registry absent | Phase A–D complete; trait cycle detection and battery migration partially done |
 | 2026-04-28-policy-pipeline-simplification | policies | implemented | branch | All Phases A–E shipped including originally-deferred Phase E | All 23 steps complete; plain functions, no `__functor`, no activation model |
+| 2026-04-28-dead-letter-queue-unregistered-keys | pipeline-simplification | implemented | branch | DLQ handler, drain, emit helpers, template class registrations all shipped | Unregistered keys queued as dead letters, re-classified on context change |
+| 2026-04-28-policy-context-enrichment-design | policies | implemented | branch | Fix 1 (schema/enrichment split) + Fix 2 (post-pipeline class wrapping) shipped | Non-schema resolve keys enrich current entity; class modules wrap post-pipeline |
+| 2026-04-28-provides-compat-shims-design | provides-removal | implemented | branch | Pipeline handler + mutual-provider shim shipped | Compat layer for main→branch migration; prerequisite for provides deletion |
+| 2026-04-29-flake-scope-pipeline-args-design | policies | implemented | branch | `pipelineOnly` utility + `den.provides.flake-scope` battery shipped | Aspect functions can destructure `lib`/`inputs`/`den` via enrichment mechanism |
+| 2026-04-29-forward-elimination-trait-unification | traits | partially-implemented | branch | Trait delivery fix shipped; sub-pipeline elimination deferred | fxResolve reorder + subTraitModule; classImports sharing blocks elimination |
+| 2026-04-29-scope-partitioned-pipeline-state | pipeline-simplification | in-progress | branch | Spec in progress | Per-entity pipeline state partitioning for forward sub-pipeline elimination |
 | 2026-04-24-class-module-partial-apply-design | class-modules | implemented | branch | Fully shipped with scope extensions (full-application path, trait consumption, deferred-import wrapping) | `wrapClassModule` live with collision policies at three levels |
 | 2026-04-25-eliminate-stages-design | stages | implemented | branch | `den.stages` tombstoned; `den.schema.<kind>.includes` is the live interface | Three-layer model active; `resolveEntity` + `resolve-entity` effect are sole path |
 | 2026-04-26-direct-ref-aspects-design | stages | implemented | branch | `entityIncludes`/`rootIncludes` deleted; direct aspect refs in policies | Core structural changes present; `policy.aspects` not typed as NixOS option |
@@ -59,13 +65,14 @@ Generated: 2026-04-28. Branch under review: `feat/fx-pipeline` (169+ commits ahe
 
 | Verdict | Count |
 |---|---|
-| implemented | 16 |
-| partially-implemented | 12 |
+| implemented | 21 |
+| partially-implemented | 13 |
 | superseded | 12 |
 | not-implemented | 4 |
-| **Total** | **44** |
+| in-progress | 1 |
+| **Total** | **51** |
 
-The 4 "not-implemented" verdicts are: `effectful-pipeline-bootstrap-design` (abandoned before build), `provides-removal-design` (deferred, compat shim added instead), and two specs fully absorbed into broader supersession chains before any code landed (`fx-resolution-prototype-spec`, `commit-compaction-guide`). Of those, the first two are the relevant gaps; the latter two are process artefacts where the code shipped differently.
+The 4 "not-implemented" verdicts are: `effectful-pipeline-bootstrap-design` (abandoned before build), `provides-removal-design` (deferred, compat shim added instead), and two specs fully absorbed into broader supersession chains before any code landed (`fx-resolution-prototype-spec`, `commit-compaction-guide`). New since 2026-04-28: 5 specs implemented (DLQ, context enrichment, provides compat shims, flake-scope args, policy-pipeline-simplification Phase E), 1 partially implemented (forward-elimination/trait delivery), 1 in progress (scope-partitioned state).
 
 ---
 
@@ -160,7 +167,24 @@ ctxFromHandlers helper in aspect.nix
 2026-04-26-pipeline-simplification-targets (partial: Targets 1,2,6 not started)
     |
     v
-2026-04-26-provides-removal-design     (NOT IMPLEMENTED: compat shim only; 114 occurrences remain)
+2026-04-28-provides-compat-shims-design   (IMPLEMENTED: migration compat layer)
+    |
+    v
+2026-04-26-provides-removal-design     (NOT IMPLEMENTED: compat shim landed; 114 template occurrences remain)
+```
+
+### Chain G: pipeline infrastructure (2026-04-28+)
+
+```
+2026-04-28-dead-letter-queue-unregistered-keys  (IMPLEMENTED: DLQ handler + drain)
+2026-04-28-policy-context-enrichment-design     (IMPLEMENTED: enrichment routing + post-pipeline wrapping)
+    |
+    v
+2026-04-29-flake-scope-pipeline-args-design     (IMPLEMENTED: rides enrichment mechanism)
+2026-04-29-forward-elimination-trait-unification (PARTIAL: trait delivery shipped; elimination deferred)
+    |
+    v
+2026-04-29-scope-partitioned-pipeline-state     (IN PROGRESS: per-entity state partitioning)
 ```
 
 ---
@@ -174,13 +198,21 @@ ctxFromHandlers helper in aspect.nix
 | `hasTrait` predicate | traits-and-structural-nesting §Follow-up | No active plan |
 | Derived / computed traits (`derivedFrom`) | traits-and-structural-nesting §Follow-up | No active plan |
 | Trait attenuation (`traitFilter`) | traits-and-structural-nesting §Follow-up | No active plan |
+| Trait type validation (`den.traits.*.type` enforcement) | traits-and-structural-nesting §Follow-up | Field declared but no enforcement implemented |
 | Diagram visualization of `emit-trait` effects | traits-and-structural-nesting §Follow-up | No active plan |
+| Fleet policy topology diagram view | memory: project_diag_future_views | No active plan |
+| Parametric aspect annotation in diagrams | memory: project_diag_future_views | No active plan |
+| Unified aspect key type implementation | unified-aspect-key-type-design | Registry access resolved; implementation pending; blocks provides removal |
+| Scope-partitioned pipeline state | scope-partitioned-pipeline-state | Spec in progress; blocks forward sub-pipeline elimination |
 | `classifyKeys` full removal (Target 4) | pipeline-simplification-targets | Blocked on provides removal (Target 1) |
 | `wrapClassModule` collision detection removal (Target 2) | pipeline-simplification-targets | Breaking change; scheduled last |
 | Child shape normalization at source (Target 6) | pipeline-simplification-targets | Blocked on Target 2 |
 | Wildcard policy scoping via schema analysis (Option 4) | policy-pipeline-simplification | `__entityKind` body guards used instead; Option 4 future improvement |
 | `policy.resolve.shared` documentation | unified-policy-effects | "to be specified" clause never closed |
 | Phase 2 orchestration wiring (cross-entity traits) | provide-to-effects-design, freeform-ignore | No orchestration in `osConfigurations.nix` |
+| aspect-chain removal (fromAspect dependency) | memory: project_phase3_backlog | Deferred; forward-as-handler eliminates dependency |
+| Vestigial module deletion (parametric.nix, take.nix, perHost-perUser.nix) | memory: project_phase3_backlog | Shim-only; deferred to post-migration |
+| ctx-shim removal (den.ctx compat layer) | memory: project_phase3_backlog | Forwards to `den.schema.X.includes`; deferred |
 | `emitCrossProvider` / `emitSelfProvide` deletion | pipeline-simplification-design | Blocked on 114 template migrations |
 | `provides` option / `_` alias removal | provides-removal-design | Blocked on template migration |
 | `den-brackets.nix` provides fallback cleanup | provides-removal-design | Blocked on provides option removal |
@@ -213,7 +245,7 @@ ctxFromHandlers helper in aspect.nix
 
 | Item | Current state | Full implementation |
 |---|---|---|
-| `provides` API removal | `emitCrossProvideShims` compat shim with deprecation warnings | Delete `emitSelfProvide`, `emitCrossProvider`, `provides` option, remove from `structuralKeysSet` |
+| `provides` API removal | `emitCrossProvideShims` compat shim with deprecation warnings; `provides-compat.nix` handler + `mutual-provider-shim.nix` shipped | Delete `emitSelfProvide`, `emitCrossProvider`, `provides` option, remove from `structuralKeysSet` |
 | `perHost-perUser.nix` | Deprecated shims with `lib.warn`; logic via `perCtx` / `constantHandler` | Delete file after downstream migration |
 | `parametric.nix` | Shim-only (`fixedTo`, `expands` delegate to `mkFixedTo`) | Delete after `aspect-chain` and template migration |
 | `take.nix` | Shim-only (all forms emit `lib.warn`) | Delete after all callers removed |
@@ -221,6 +253,7 @@ ctxFromHandlers helper in aspect.nix
 | Cross-entity trait distribution | `distributeCrossEntityTraits` library function exists | Wire `osConfigurations.nix` to call distribute + pass `crossEntityTraits` |
 | `include-level dedup rollback on policy.exclude` | `include-unseen` rollback effect exists for constraint exclusions | Verify rollback fires for policy `exclude` effects |
 | `policy.aspects` typing | Untyped `routing.aspects` list in transition handler | Declare as `listOf providerType` NixOS option |
+| Forward sub-pipeline isolation | Sub-pipeline per forward spec; `classImports` shared across entities | Per-entity classImports partitioning (scope-partitioned-pipeline-state spec in progress) |
 
 ---
 
@@ -228,7 +261,7 @@ ctxFromHandlers helper in aspect.nix
 
 | Bug | Location | Severity | Status |
 |---|---|---|---|
-| `builtins.seq (map ...) null` never fires traces — unregistered aspect class key warnings are silently swallowed | `nix/lib/aspects/fx/aspect.nix:842-845` | Medium — typos in class keys produce no user feedback | Open; one-line fix (`builtins.foldl'`) not landed despite being flagged before feat/traits merge |
+| `builtins.seq (map ...) null` never fires traces — unregistered aspect class key warnings are silently swallowed | `nix/lib/aspects/fx/aspect.nix:842-845` | Low (was Medium) — DLQ now handles unregistered keys instead of relying on trace warnings | Partially mitigated by DLQ (2026-04-28); trace fix (`builtins.foldl'`) still not landed |
 | `modulesPath` dead destructure in `pipeline.nix:303` | `nix/lib/aspects/fx/pipeline.nix:303` | Low — trivial dead code | Open |
 | `emitNestedAspect` silently drops function-valued keys with no trace warning (`aspect.nix:800`) | `nix/lib/aspects/fx/aspect.nix:800` | Low-medium — function-valued nested keys coerced to `{}` without user feedback | Open |
 | `traitCollectorHandler` captures root `ctx` at construction time, not `state.currentCtx` — Tier 2 classification can misfire if trait-providing aspects have args satisfied only by transitions | `nix/lib/aspects/fx/handlers/trait.nix:113` | Low in practice (safe fallback to Tier 3 added in `07055169`) — but architectural limitation | Partially addressed; full fix (read `state.currentCtx`) not landed |
@@ -260,6 +293,8 @@ The legacy removal work is complete. `ctx-apply.nix`, `resolve.nix`, `adapters.n
 
 The policy system went through three design generations in these specs. The `effectful-pipeline-bootstrap` design (resolve-policy / resolve-target effects, per-policy `handlers` field) was abandoned before it was built when the `den.stages` deletion and `policy-dispatch.nix` deletion made its foundation impossible. The final design — plain functions returning typed `policy.resolve/include/exclude` effect constructors, dispatched by direct iteration in `transition.nix`, with `__entityKind` body guards — is fully shipped including the originally-deferred Phase E steps. The `corePolicies` registry was never built; core policies live directly in `den.policies`. Phase 2 cross-entity distribution (the flagship fleet use case) is wired only at the library level; `osConfigurations.nix` is not connected. Aspect-included policies (`policyFns` key on aspects) are live and used by the HM/maid/hjem batteries. Policy rollback on `exclude` effects is unverified.
 
+**New since 2026-04-28:** Policy context enrichment shipped — non-schema resolve keys (e.g., `isNixos`, `isDarwin`) now route as context enrichment of the current entity rather than creating empty child entities. All `wrapClassModule` calls deferred to a post-pipeline pass, ensuring policy-injected context is available regardless of class module form. Flake-scope pipeline args shipped — aspect functions can destructure `lib`/`inputs`/`den` directly via a `den.provides.flake-scope` battery that rides the enrichment mechanism, with `pipelineOnly` collision policy preventing conflicts at NixOS evaluation.
+
 ### class-modules
 
 Fully shipped with scope extensions beyond the original spec. `wrapClassModule` supports partial application (den args pre-applied), full application (when all args are den args), trait consumption via lazy `_den.traits` thunks, and deferred-import nesting. Collision policies at three levels (`aspect.meta.collisionPolicy`, entity `collisionPolicy`, `den.config.classModuleCollisionPolicy`) are implemented with companion validator modules using deferred thunk evaluation for NixOS fixed-point safety. The only divergence from spec is `ctxFromHandlers` replacing `aspect.__ctx or {}` — the correct adaptation given `__ctx` removal.
@@ -272,10 +307,14 @@ The `den.stages` elimination is fully complete. `den.stages` is tombstoned (`mod
 
 The traits pipeline is substantially complete. All five migration phases (schema registry, structural detection, three-tier trait collection, `_den.traits` injection, cross-entity distribution, forward battery schema integration) are shipped. Three follow-up items (`hasTrait`, derived traits, trait attenuation) are explicitly deferred with no active plan. The known silent-failure bug (`builtins.seq` at `aspect.nix:842` not firing traces for unregistered keys) was flagged before feat/traits merge and is still open. The `provides` structural key has no deprecation warning at the aspect level (only at bracket path level). Cross-entity orchestration has the same gap as the policies component: `fxResolveTree` does not call `distributeCrossEntityTraits`.
 
+**New since 2026-04-28:** Forward trait delivery fix shipped (commit b44fd284). fxResolve reorder ensures `traitModule` is available when forwards run; sub-pipelines synthesize `subTraitModule` from `sub.traits` (Tier 1/2 only). Sub-pipeline elimination was attempted but failed — `classImports` buckets are shared across entities, causing cross-contamination on multi-user hosts. Sub-pipeline isolation is structurally necessary; scope-partitioned pipeline state spec is in progress to address this.
+
 ### pipeline-simplification
 
 Of the six simplification targets, Targets 3 (`runSubPipeline` extraction) and 5 (fan-out generalization via `resolve.shared`) are complete. Target 4 (`classifyKeys` → declared schemas) is partial — registry dispatch was added but full static annotation was not. Targets 1, 2, and 6 are not started. The `host-aspects` battery (a separate item in this group) is fully shipped on both main and branch. The overall arc is clear: the "immediate wins" are done; the remaining targets require either a migration pass (Target 1: 114 template occurrences) or are intentionally last due to breaking-change risk (Targets 2 and 6).
 
+**New since 2026-04-28:** Dead letter queue shipped — unregistered aspect keys no longer silently drop. Instead, they queue as dead letter effects and re-classify when context changes (deferred includes registering new classes/traits). Template `den.classes` registrations added to prevent DLQ for known classes. This partially addresses Target 4 at runtime without requiring static annotation.
+
 ### provides-removal
 
-This is the largest active gap. The spec's seven deletion steps (migrate templates, delete `emitSelfProvide`, delete `emitCrossProvider`, remove `provides` option, remove from `structuralKeysSet`, clean up `den-brackets.nix`) have not started. Instead, the branch chose a "shim-first" approach: `provides-compat.nix` handler + `emitCrossProvideShims` intercept old `provides.X` patterns, emit deprecation warnings, and re-route to `policy.include` effects at runtime. The legacy machinery (`emitSelfProvide`, `emitCrossProvider`, `provides` option, `_` alias) remains fully live. Template migration has not begun — approximately 114 occurrences across 30 files remain. This work is the primary blocker for subsequent pipeline cleanup (classifyKeys removal, child shape normalization).
+This is the largest active gap. The spec's seven deletion steps (migrate templates, delete `emitSelfProvide`, delete `emitCrossProvider`, remove `provides` option, remove from `structuralKeysSet`, clean up `den-brackets.nix`) have not started. The compat shims spec (2026-04-28-provides-compat-shims-design) is now fully implemented — `provides-compat.nix` handler + `mutual-provider-shim.nix` provide the migration bridge. `emitCrossProvideShims` intercepts old `provides.X` patterns, emits deprecation warnings, and re-routes to `policy.include` effects at runtime. The legacy machinery (`emitSelfProvide`, `emitCrossProvider`, `provides` option, `_` alias) remains fully live. Template migration has not begun — approximately 114 occurrences across 30 files remain. Provides removal is now blocked on the unified aspect key type design (registry access prerequisite resolved, implementation pending). This work is the primary blocker for subsequent pipeline cleanup (classifyKeys removal, child shape normalization).

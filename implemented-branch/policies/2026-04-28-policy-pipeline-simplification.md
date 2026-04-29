@@ -1,6 +1,8 @@
 # Policy Pipeline Simplification
 
-## Status: Draft
+## Status: Implemented (Phases A-E)
+
+All phases shipped on `feat/fx-pipeline`. Policies are plain functions, all metadata (`from`, `to`, `__functor`, `_core`, `isolateFanOut`) removed, dead dispatch code deleted. Template policies converted (commit f5282ac8). ~659 tests passing.
 
 ## Prerequisites
 
