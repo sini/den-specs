@@ -1,86 +1,56 @@
-# Provides Removal (Post Unified Policy Effects)
+# Provides Removal (Post Transition Elimination)
 
-**Date:** 2026-04-27 (amended 2026-04-28)
+**Date:** 2026-04-27 (amended 2026-05-02)
 **Branch:** feat/fx-pipeline
-**Status:** Draft — blocked on compat layer
-**Prerequisites:**
+**Status:** Unblocked — compat shims shipped, transition elimination complete
+**Prerequisites (all met):**
 - Unified policy effects design (2026-04-27) — implemented
 - Policy pipeline simplification (2026-04-28) — implemented
-- **Backwards-compat shims (2026-04-28-provides-compat-shims-design.md) — MUST ship first**
+- Backwards-compat shims (2026-04-28) — shipped
+- Transition elimination (2026-05-01) — shipped (612/616 pass)
 
 ## Context
 
-With unified policy effects and pipeline simplification both landed, the `provides` structural key has no remaining purpose. All `provides.X` patterns are replaced by:
-- **`policies.X`** — aspect-included policy functions returning typed effects (`policy.include`, `policy.resolve`, `policy.exclude`)
-- **`mutual-provider`** — eliminated; bidirectional config expressed as aspect-included policies
+The `provides` structural key has no remaining purpose. All `provides.X` patterns are handled by:
+- **`policies.X`** — aspect-included policy functions returning typed effects
+- **`provides-compat.nix`** — backwards-compat shim translating `provides.X` to policy effects with deprecation warnings
 
-This spec covers deleting `provides` from the pipeline, type system, and all consumer code. It also covers collateral simplifications that become possible once `provides` and the old policy dispatch model are gone.
+Removing `provides` eliminates the compat shim, which causes 2 of the 4 remaining test failures:
+- `deadbugs-cybolic-routes.test-has-no-dups` — duplicate module from provides-compat + routes interaction
+- `user-host-mutual-config.test-host-parametric-unidirectional` — mutual-provider compat not working with current pipeline
 
-> **IMPORTANT:** No removal work may proceed until the backwards-compat shims spec
-> (`2026-04-28-provides-compat-shims-design.md`) is implemented and shipped. Users
-> migrating from `main` rely on `provides.X` cross-provide patterns, `den._.mutual-provider`,
-> and other surfaces that this spec targets for deletion. The compat layer translates
-> these legacy patterns to the new policy mechanism with deprecation warnings, giving
-> users a migration path. Removal happens in a future release after the compat layer
-> has been in place.
+## What Changed Since Original Spec
 
-## Current State (post pipeline simplification)
+| Component | Original status | Current status |
+|---|---|---|
+| `transition.nix` | Contained `emitCrossProvider` | **Deleted entirely** (-1011 lines) |
+| `emitCrossProvider` (branch-era) | Phase 2 removal target | **Already deleted** with transition.nix |
+| DLQ | Interacted with provides classification | **Eliminated** — unknown keys emit as classes |
+| Trait system | Interacted with provides routing | **Deleted** for fleet/den.exports reimplementation |
+| `emitTransitions` | Called after emitCrossProvideShims | **Replaced** by `installPolicies` using scope.provide |
+| `dispatch-policies.nix` | N/A (didn't exist yet) | Created then **deleted** — replaced by inline installPolicies |
 
-The following items from the original spec are **already deleted** by pipeline simplification work:
+## What Gets Deleted
 
-| Component | Deleted in |
-|---|---|
-| `policy-dispatch.nix` (entire file) | commit 30ba636e |
-| `mutual-provider.nix` (entire file) | commit 12fed6aa |
-| `compilePolicyHandlers` | commit 30ba636e |
-| `policyEffectNamesFor` | commit 30ba636e |
-| `emitCrossProvider` (main-era) | commit 12fed6aa (mutual-provider deletion) |
-| `collectPolicyHandlers` | commit 72b34735 |
-| `activePoliciesFor` / `ctxSatisfies` dispatch | commit 29156fe0 / a2a7c933 |
-| All `from`/`to`/`__functor`/`_core` on policies | commits through de80246b |
+### Pipeline machinery
 
-The following remain and are **NOT reduced** from the original spec:
-- `synthesize-policies.nix` — trimmed to 29 lines, exports only `resolveArgsSatisfied` (still live)
-- `policy-types.nix` — trimmed to 9 lines, exports only `policyFnArgs` (still live)
+| Component | File | Lines | Status |
+|-----------|------|-------|--------|
+| `emitSelfProvide` | `aspect.nix` | ~51 | Delete — replaced by `resolveEntity.includes` |
+| `mkPositionalInclude` | `aspect.nix` | ~30 | Delete — only called by `emitSelfProvide` |
+| `mkNamedInclude` | `aspect.nix` | ~30 | Delete — only called by `emitSelfProvide` |
+| `emitCrossProvideShims` call | `aspect.nix` resolveChildren | ~2 | Delete |
+| `substituteChild` | `include.nix` | ~18 | Delete — verify no non-provides callers |
 
-**Note:** A branch-era `emitCrossProvider` exists in `transition.nix` (commit `ed1301a4`). This is NOT the same as the main-era cross-provide mechanism — it handles `provides.${entityKind}` patterns during transition resolution and is part of the provide-to policy implementation. It is a Phase 2 removal target alongside `emitSelfProvide`.
-
-## What Gets Deleted (remaining)
-
-> Items already deleted by pipeline simplification are listed in "Current State" above.
-> This section covers only what remains after compat shims have been in place.
-
-### Pipeline machinery (~120 lines)
-
-| Component | File | Lines | Why dead |
-|-----------|------|-------|----------|
-| `emitSelfProvide` | `aspect.nix` | ~51 | `provides.${self.name}` pattern replaced by `resolveEntity.includes` |
-| `mkPositionalInclude` | `aspect.nix` | ~30 | Only called by `emitSelfProvide` |
-| `mkNamedInclude` | `aspect.nix` | ~30 | Only called by `emitSelfProvide` |
-| `substituteChild` | `include.nix` | ~18 | `substituteAspect` replaced by `policy.exclude` + `policy.include` |
-
-### Compat handler removal
+### Compat handler
 
 | Component | File | Notes |
 |-----------|------|-------|
-| `provides-compat.nix` | `handlers/provides-compat.nix` | Cross-provide→policy translation shim |
-| `emitCrossProvideShims` call | `aspect.nix` resolveChildren | Single call site |
-| `mutual-provider-shim.nix` | `modules/compat/` | No-op aspect shim |
+| `provides-compat.nix` | `handlers/provides-compat.nix` | 96 lines — entire file |
+| import line | `handlers/default.nix` | 1 line |
+| `emitCrossProvideShims` import | `aspect.nix` | 1 line |
 
-### Branch-era provides machinery
-
-| Component | File | Lines | Why dead |
-|-----------|------|-------|----------|
-| `emitCrossProvider` | `transition.nix` | ~43 | `provides.${entityKind}` routing; dead once provides structural key removed |
-
-### Utility files to relocate (not delete)
-
-| File | Current | After |
-|------|---------|-------|
-| `synthesize-policies.nix` | 29 lines, `resolveArgsSatisfied` | Inline into transition.nix or keep as-is |
-| `policy-types.nix` | 9 lines, `policyFnArgs` | Inline into transition.nix or keep as-is |
-
-### Type system cleanup (~20 lines)
+### Type system
 
 | Component | File | Lines |
 |-----------|------|-------|
@@ -89,16 +59,15 @@ The following remain and are **NOT reduced** from the original spec:
 | `"provides"` in `structuralKeysSet` | `aspect.nix` | 1 |
 | duplicate `"policies"` in `structuralKeysSet` | `aspect.nix` | 1 |
 
-### Simplifications
+### Support files
 
-| Component | File | Current | After |
-|-----------|------|---------|-------|
-| `resolveChildren` | `aspect.nix` | 4-phase (selfProvide → aspectPolicies → includes → transitions) | 3-phase (aspectPolicies → includes → transitions) |
-| deprecation trace block | `aspect.nix` | ~7 lines detecting cross-provide keys | removed (compat handler owns this during compat phase; nothing left after) |
+| Component | File | Notes |
+|-----------|------|-------|
+| `resolveWithProvidesFallback` | `den-brackets.nix` | Delete fallback, keep direct resolution |
 
-## Migration: `provides.X` Patterns
+## Template Migration
 
-All `provides.X` writes in user/template code become aspect-included policies:
+All `provides.X` writes become aspect-included policies:
 
 ```nix
 # Before:
@@ -107,8 +76,8 @@ den.aspects.igloo.provides.to-users = { user, ... }: {
 };
 
 # After:
-den.aspects.igloo.policies.to-users = { host, user }:
-  [ (policy.include { homeManager.programs.direnv.enable = true; }) ];
+den.aspects.igloo.policies.to-users = { host, user, ... }:
+  [ (den.lib.policy.include { homeManager.programs.direnv.enable = true; }) ];
 ```
 
 ```nix
@@ -118,84 +87,80 @@ den.aspects.igloo.provides.alice = {
 };
 
 # After:
-den.aspects.igloo.policies.to-alice = { host, user }:
+den.aspects.igloo.policies.to-alice = { host, user, ... }:
   lib.optional (user.name == "alice")
-    (policy.include { homeManager.programs.vim.enable = true; });
-```
-
-```nix
-# Before: programmatic read
-find-mutual = from: to: from.aspect.provides.${to.aspect.name} or {};
-
-# After: eliminated — mutual-provider gone, policies handle routing
+    (den.lib.policy.include { homeManager.programs.vim.enable = true; });
 ```
 
 ### `den.provides.*` factory namespace
 
-The `den.provides` top-level namespace (`den.provides.forward`, `den.provides.define-user`, `den.provides.import-tree`, etc.) is the **factory registry** — NOT the aspect-level `provides` structural key. It is unaffected and out of scope.
-
-### `den-brackets.nix` provides fallback
-
-The `resolveWithProvidesFallback` in `den-brackets.nix` falls back to `aspect.provides.X` when direct `aspect.X` lookup fails. With `provides` gone, delete the fallback — direct resolution only.
+The `den.provides` top-level namespace (`den.provides.forward`, `den.provides.define-user`, etc.) is the **factory registry** — NOT the aspect-level `provides` structural key. It is unaffected.
 
 ## `resolveChildren` Simplification
 
-Current state (4-phase): `emitSelfProvide` → `emitCrossProvideShims` (compat) → `emitAspectPolicies` → `emitIncludes` → `emitTransitions`.
-
-After Phase 2 removal of `emitSelfProvide` and compat shims (3-phase):
-
-```nix
-childResolution =
-  fx.bind (emitAspectPolicies aspect) (_:
-    fx.bind (emitIncludes emitCtx (aspect.includes or [])) (includeResults:
-      fx.bind (emitTransitions aspect) (transitionResults:
-        fx.pure (includeResults ++ transitionResults))));
+Current (aspect.nix):
+```
+emitSelfProvide → emitCrossProvideShims → emitTraitSchemas → emitAspectPolicies → emitIncludes → installPolicies
 ```
 
-`emitTransitions` remains — it handles `into` transitions and policy dispatch. Only the self-provide and compat phases are removed.
-
-## Dependency Order
-
-### Phase 1: Compat layer (MUST ship first — separate spec)
-
-See `2026-04-28-provides-compat-shims-design.md`. No removal work until this is complete.
-
-### Phase 2: Removal (future release, after migration period)
-
+After:
 ```
-Step 1: Migrate provides.X patterns in templates → policies.X
-Step 2: Delete provides-compat.nix handler + emitCrossProvideShims call from resolveChildren
-Step 3: Delete mutual-provider-shim.nix from modules/compat/
-Step 4: Delete emitSelfProvide + mkPositionalInclude + mkNamedInclude from aspect.nix
-Step 5: Delete emitCrossProvider from transition.nix (branch-era provides.${entityKind} routing)
-Step 6: Simplify resolveChildren (remove selfProvide phase)
-Step 7: Remove provides option + _ alias from types.nix
-Step 8: Remove "provides" (and duplicate "policies") from structuralKeysSet
-Step 9: Clean up den-brackets.nix provides fallback
-Step 10: Assess substituteChild in include.nix — verify if used outside provides patterns
+emitTraitSchemas → emitAspectPolicies → emitIncludes → installPolicies
 ```
 
-Steps 2-3 are the compat teardown. Steps 4-10 are the provides infrastructure removal.
+Two phases removed. `emitSelfProvide` is dead because `resolveEntity.includes` already handles the self-provide pattern. `emitCrossProvideShims` is dead because the compat layer is being removed.
 
-## Impact Summary (revised)
+## Preserved Insights (from superseded forward-route-unification spec)
+
+### `adaptArgs` Semantics
+
+Forward `adaptArgs` uses `lib.evalModules { specialArgs = adapted; }`. Route `adaptArgs` uses structural nesting. These have different semantics:
+- `specialArgs` bypass option checks — args are available without declaration
+- `_module.args` goes through the option system — may conflict with NixOS's own bindings (e.g., `pkgs`)
+
+For any adapter forwards that reference `adaptArgs`, the structural nesting must use `_module.specialArgs` (not `_module.args`) to match the old evaluation semantics. This is already handled in `wrapRouteModules` for Tier 1 routes.
+
+### `fromAspect` Pattern Mapping
+
+The old `fromAspect` field on forwards is eliminated by the unified pipeline. The 4 patterns map to:
+
+| Old pattern | New mechanism |
+|---|---|
+| `lib.head aspect-chain` | Default — policy fires in current entity's scope |
+| `host.aspect` (same pipeline) | Policy fires in host's scope |
+| `den.lib.resolveEntity "user" ctx` | Policy fires during user resolution — scope matches |
+| `den.lib.parametric.fixedTo { host } aspect` | Policy fires in appropriate scope |
+
+### Guard Semantics
+
+Forward guards are **config transformers** (`lib.optionalAttrs cond`), not boolean gates (`lib.mkIf cond`). Route guards use `lib.mkIf`. These are semantically different:
+- `lib.optionalAttrs false { ... }` → `{}` (attrs removed entirely)
+- `lib.mkIf false { ... }` → attrs present but conditionally disabled
+
+For the remaining adapter forwards, verify that guard conversion preserves the intended semantics. Most cases work with `lib.mkIf` but edge cases with option presence detection may differ.
+
+## Execution Steps
+
+```
+Step 1:  Migrate provides.X patterns in templates → policies.X (~35 files)
+Step 2:  Delete provides-compat.nix + emitCrossProvideShims call
+Step 3:  Delete emitSelfProvide + mkPositionalInclude + mkNamedInclude
+Step 4:  Simplify resolveChildren (remove selfProvide + compat phases)
+Step 5:  Remove provides option + _ alias from types.nix
+Step 6:  Remove "provides" (and duplicate "policies") from structuralKeysSet
+Step 7:  Clean up den-brackets.nix provides fallback
+Step 8:  Verify substituteChild in include.nix — delete if unused outside provides
+Step 9:  Run full CI — expect 2 of 4 remaining failures to resolve
+Step 10: Delete superseded specs (forward-route-unification, forward-simplification-unified-dispatch, dispatch-dedup-investigation)
+```
+
+## Impact
 
 | Metric | Value |
 |--------|-------|
-| Lines deleted (remaining, Phase 2) | ~190 (pipeline: selfProvide + crossProvider + compat) + ~20 (types) |
-| Already deleted by pipeline simplification | ~690+ |
-| Files to delete (Phase 2) | 2 (provides-compat.nix, mutual-provider-shim.nix) |
-| Files with changes (Phase 2) | 5 (aspect.nix, transition.nix, types.nix, den-brackets.nix, include.nix) |
-| Template files to migrate | ~35 (provides.X patterns) |
-
-## Risks
-
-- **Compat layer must ship first**: Users on `main` already hit hard errors (e.g., `den._.mutual-provider` missing). Phase 2 removal is blocked until the compat layer has been in place for a release cycle.
-- **Template migration volume**: ~35 files, mechanical but high volume. Each `provides.X` becomes a `policies.X` function returning effects. Compat layer buys time for gradual migration.
-- **`den.provides` factory confusion**: Users may confuse the `den.provides.*` factory namespace (kept) with the aspect `provides` structural key (deleted). Clear documentation needed.
-
-## Out of Scope
-
-These remain as future targets:
-- **`wrapClassModule` collision detection** (~100 lines) — needs arg namespacing, separate breaking change
-- **`classifyKeys` → declared schemas** (~67 lines) — can follow this work since `provides` no longer in the classification set
-- **Child shape normalization** (~57 lines) — depends on collision detection removal
+| Lines deleted | ~210 (pipeline: selfProvide + compat + types) |
+| Files deleted | 1 (provides-compat.nix) |
+| Files modified | ~5 (aspect.nix, include.nix, types.nix, den-brackets.nix, handlers/default.nix) |
+| Template files migrated | ~35 (provides.X → policies.X) |
+| Test failures resolved | 2 of 4 remaining (provides-compat interaction bugs) |
+| Concepts removed | `provides` structural key, self-provide, cross-provide shims, mutual-provider compat |

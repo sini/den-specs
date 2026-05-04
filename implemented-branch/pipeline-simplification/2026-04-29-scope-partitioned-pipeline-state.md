@@ -1,6 +1,33 @@
 # Scope-Partitioned Pipeline State
 
-## Status: Draft (rev 3 — incorporated review)
+## Status: Partially shipped (rev 4)
+
+### What shipped (feat/fx-pipeline, 9 commits)
+
+- **Scope infrastructure:** `mkScopeId`, scope-partitioned state fields, root scope init in mkPipeline
+- **Dual-write handlers:** All emission handlers (classImports, traits, forwardSpecs) and bookkeeping handlers (constraints, chain, deferred, DLQ, aspectPolicies) write to both flat and scoped partitions
+- **Scope push/pop in transitions:** `resolveFanOut` and `resolveContextValue` push/pop scopes, populating scopeParent/scopeChildren/scopeContexts tree
+- **Dynamic trait schema registration:** `register-trait-schema` + `get-trait-schemas` effects, `emitTraitSchemas` in resolveChildren, `classifyKeys` reads dynamic registry
+- **Trait inheritance:** `inheritTraits` walks scope tree (list/map/single strategies), `traitModuleForScope` synthesizes per-scope trait modules, `traitArgHandler` reads with scope-tree inheritance
+- **Provide-to removal:** Handler, distribute-cross-entity.nix, crossEntityTraits parameter, resolveSiblingTransition all deleted. Scope-inheritance tests replace provide-to tests
+- **currentCtx removal:** All readers use `scopeContexts.${currentScope}`
+- **runSubPipeline elimination:** Function deleted, logic inlined at call sites. fxResolve trait module uses `traitModuleForScope` (scoped reads)
+
+### What remains — see `2026-04-29-policy-route-class-delivery.md`
+
+The remaining gaps are addressed by the **policy.route** spec, which replaces forwards with policy-driven routing over scope partitions:
+
+1. **fxResolve class imports still read flat state.** Forward source content bypasses scoped partitions because `applyForwardSpecs` runs post-pipeline sub-pipelines. **Fix:** `policy.route` (Tier 1, ~90% of forwards) reads from scope partitions directly. Simplified forwards (Tier 2, ~10%) read via `sourceScopeId`. No sub-pipelines.
+
+2. **Scope-prefixed dedup keys.** `ctxSeen` and `includeSeen` need scope-prefixed keys for Tier 2 forward inline-walk. Deferred from Task 2 of this spec.
+
+3. **Flat state field removal.** Blocked on #1. Once fxResolve reads scoped, dual-writes can be removed.
+
+4. **Unified policy dispatch.** Orthogonal. `dispatchPolicyIncludesHandler` still uses `includeOnly` filter. Deferred.
+
+5. **Forward auto-detection.** After policy.route ships, the `emit-forward` handler can auto-classify simple forwards as routes — `!(spec ? adapterModule) && !(spec ? mapModule) && builtins.isList (spec.intoPath or [])`. Zero user migration: `den.provides.forward` silently routes Tier 1 cases through `policy.route` internally.
+
+**Resume point:** Implement `2026-04-29-policy-route-class-delivery.md` migration steps 1-7. Then return here for items 3-5.
 
 ## Problem
 

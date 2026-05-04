@@ -1,17 +1,16 @@
 # Forward Sub-Pipeline Elimination and Trait Delivery Unification
 
-## Status: Partially Shipped
+## Status: Shipped
 
-**Shipped (commit b44fd284 on `feat/fx-pipeline`):**
+**Shipped (commits b44fd284 through 5572cc67 on `feat/fx-pipeline`):**
 - fxResolve reorder: wrap → traitModule → applyForwardSpecs
 - `applyForwardSpecs` accepts `{ forwardSpecs, classImports, traitModule, hasTraitSchemas }`
 - Sub-pipeline path synthesizes `subTraitModule` from `sub.traits` (Tier 1/2 only)
 - `runSubPipeline` reordered to match (wrap before forwards)
 - evalConfig forwards now receive trait data via subTraitModule
-- 659/659 tests passing
 
-**Deferred: Same-entity forward sub-pipeline elimination.**
-`classImports` buckets are shared across all entities in the pipeline (host + all users). On multi-user hosts, `classImports.homeManager` contains modules from ALL users merged together. The bucket read heuristic (`bucket != []`) causes 13 test failures — one user's forward gets another user's modules mixed in. Sub-pipeline isolation is structurally necessary for entity-scoped class collection.
+**Previously deferred item — resolved by scope partitioning:**
+Same-entity forward sub-pipeline elimination was blocked by shared `classImports` bucket contamination. Resolved by `2026-04-29-scope-partitioned-pipeline-state.md`: scoped state merge across sub-pipeline boundaries + `fxResolve` reads from `scopedClassImports` per scope. Tier 1 forwards auto-detect as routes (read scope partitions). Tier 2 forwards retain `resolveForwardSource` for adapter/cross-entity cases. Flake output forwards eliminated by `policy.instantiate`. 673/673 tests passing.
 
 ## Problem
 

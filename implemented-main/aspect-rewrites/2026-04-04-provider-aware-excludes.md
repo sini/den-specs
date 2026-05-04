@@ -65,3 +65,20 @@ is non-empty. The Mermaid renderer shows qualified labels:
 - `2026-04-04-deep-provider-cascade.md` — supersedes the `__provider`
   format (changed from `nullOr str` to `listOf str`) and adds
   provider-aware substitute, deep cascade, and namespace qualification.
+Here's the analysis:
+
+  Why extractClassModulesDeep is a unique path:
+
+  The compat shim policy functions are pure functions ({ host, user, ... } -> [effect]) that return a list of policy effects. They run inside installPolicies at entity resolution time. They
+  can't use the fx monad directly.
+
+  Can we use policy.include instead?
+
+  Yes — and this is the cleaner approach. Instead of manually walking includes and extracting class modules as policy.provide effects, the compat shim could return policy.include effects for
+  each item in the includes list. The pipeline would then process them through policyEmitIncludes → emit-include → emitIncludes — the full walk with dedup, parametric resolution, class
+  extraction, etc.
+
+  Let me check if this approach would work for the to-users case. The concern: policy.include injects into the current resolution context. For to-users, we're inside a user entity resolution,
+  so the includes would be processed at user scope — which is exactly where we want homeManager modules to land.
+
+  Let me try the refactor:
