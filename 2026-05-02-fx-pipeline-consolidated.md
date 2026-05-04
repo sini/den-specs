@@ -1,9 +1,9 @@
 # FX Pipeline Refactor — Consolidated Spec
 
-**Date:** 2026-05-02
+**Date:** 2026-05-02 (updated 2026-05-04)
 **Branch:** feat/fx-pipeline
 **PR:** #475
-**CI:** 629/629
+**CI:** 634/634
 **Scope:** Refactor narrative, current architecture, remaining work, forward plan
 
 ## 1. Introduction
@@ -82,7 +82,7 @@ The cleanup arc deleted ~3024 net lines and replaced overlapping mechanisms with
 
 ### 2.3 The Current Architecture (Post-Cleanup)
 
-The pipeline is 4570 lines across 27 files. The four-concern model alignment after cleanup:
+The pipeline is ~4129 lines across 43 files (post-simplification arc, 2026-05-04). The four-concern model alignment after cleanup:
 
 | Concern | Midpoint mechanism | Post-cleanup mechanism |
 |---------|-------------------|----------------------|
@@ -245,12 +245,13 @@ Root-scope forward specs must be propagated to child scopes **during the pipelin
 
 | Metric | Value |
 |--------|-------|
-| Commits ahead of main | 293 |
+| Commits ahead of main | 303+ |
 | nix/lib/ lines (main → HEAD) | 3335 → 12285 (+8950, includes diagrams) |
 | modules/ lines (main → HEAD) | 1462 → 1769 (+307) |
-| fx/ pipeline lines (main → HEAD) | 1178 → 4570 (+3392) |
-| git diff --stat (nix/lib + modules) | 124 files changed, +11782, -2525 |
-| Tests | 629/629 passing |
+| fx/ pipeline lines (main → HEAD) | 1178 → 4129 (+2951, post-simplification) |
+| fx/ pipeline files | 43 (up from 15 pre-simplification, 27 pre-cleanup) |
+| git diff --stat (nix/lib + modules) | 131 files changed, +11442, -2646 |
+| Tests | 634/634 passing |
 
 ---
 
@@ -351,13 +352,22 @@ Forward items no longer block anything.
 
 ## 7. What Comes Next: Remaining Cleanup
 
-### 7.1 Handler File Decomposition
+### 7.1 Handler File Decomposition — COMPLETE (2026-05-04)
 
-**Shipped:** `aspect.nix` decomposed into `class-module.nix`, `key-classification.nix`, `content-util.nix`, `include-emit.nix`, `wrap-classes.nix`. `transition.nix` deleted entirely.
+**Phase 5 (cleanup arc):** `aspect.nix` decomposed into `class-module.nix`, `key-classification.nix`, `content-util.nix`, `include-emit.nix`, `wrap-classes.nix`. `transition.nix` deleted entirely.
 
-**Remains:**
-- `emitSelfProvide` / `emitCrossProvideShims` / `provides-compat.nix` — all deleted (2026-05-04). Functionality folded into `emitAspectPolicies` in `include-emit.nix`. See Section 5 and `2026-05-04-provides-cleanup-design.md`.
-- `policy-dispatch.nix` at 656 lines is the largest file. Consider extraction of `classifyPolicyEffects` and enrichment iteration into focused helpers. Not urgent — the file is well-structured with clear function boundaries.
+**Phase 6 (simplification arc, 2026-05-04):** Full structural decomposition:
+- `policy-dispatch.nix` (646 lines) → `policy/` directory: classify.nix, dispatch.nix, apply.nix, schema.nix, iterate.nix, default.nix
+- `handlers/tree.nix` (365 lines) → 7 focused handler files: constraint.nix, chain.nix, class-collector.nix, deferred.nix, policy.nix, route.nix, instantiate.nix
+- `include-emit.nix` (406 lines) → `aspect/` directory: children.nix, normalize.nix, provide.nix
+- `route.nix` (342 lines) → `route/` directory: wrap.nix, apply.nix, default.nix
+- `pipeline.nix` fxResolve (148 lines) → `resolve.nix` with phased helpers
+- `provides-compat.nix` — deleted, folded into `emitAspectPolicies`
+- All functions decomposed toward ≤20 lines (largest remaining: handler attrsets and irreducible recursion)
+- Shared `handlers/state-util.nix` for scopedAppend/scopedMerge
+- Performance: flat caches for constraint registry and aspect policies (O(1) lookups)
+
+No file exceeds 301 lines. No function exceeds 50 lines (excluding handler attrset definitions).
 
 ### 7.2 Constraint Handler Simplification
 
@@ -373,7 +383,7 @@ Delete `substituteChild` from `include-emit.nix`, `substitute` type from `constr
 
 ### 7.3 Architecture Cleanup Phase 3a: providerType Dispatch
 
-`types.nix:308` has a dead conditional — both branches call `contentType.merge`. The comment documents that the else-branch should dispatch to `providerType` for unregistered freeform keys.
+~~`types.nix:308` has a dead conditional — both branches call `contentType.merge`.~~ **Fixed 2026-05-04:** Dead branch collapsed to single `contentType.merge loc defs` expression. The placeholder no longer exists in code.
 
 **Design:** Two-branch dispatch in `aspectKeyType`:
 - Registered class keys → `contentType.merge` (ClassModule: provenance-wrapped `__contentValues`)
@@ -580,7 +590,7 @@ Suspected dead or unnecessary code paths. Each should be verified (grep for call
 
 | Item | Location | Why suspected vestigial |
 |------|----------|----------------------|
-| `aspectKeyType` dead branch | `types.nix:308` | Both branches identical — placeholder | Section 7.3 |
+| ~~`aspectKeyType` dead branch~~ | ~~`types.nix:308`~~ | ~~Both branches identical~~ | **Fixed 2026-05-04** |
 | Duplicate `"policies"` in structuralKeysSet | `key-classification.nix:15` | Single entry present — no duplicate. Mentioned in provides-removal spec was wrong. |
 | ~~`hostFramework = []`~~ | `resolve-entity.nix` | **Already removed** (Phase 1d shipped) |
 | ~~`policyFnArgs` / `policy-types.nix`~~ | `nix/lib/policy-types.nix` | **Already removed** (Phase 1e shipped, file deleted) |
@@ -675,6 +685,8 @@ In practice this is rarely an issue — service ports, persistence paths, and ba
 - Pipeline-time trait flags: simple boolean/enum registry, lightweight `classifyKeys` branch
 - Cross-host data: `fleet` + `den.exports` (plain NixOS module code, no pipeline involvement)
 - Trait-to-class routing: `policy.route { fromTrait = "persist"; intoClass = "nixos"; ... }` (the route infrastructure already supports this — `fromTrait` field is in the spec but implementation is deferred to traits reimplementation)
+- **Lazy trait values** (new, 2026-05-04): trait emissions that depend on `config` are collected as thunks at pipeline-time. Resolution happens lazily via Nix evaluation when consumers access the value. This enables pipeline-time aggregation of config-dependent data (e.g., collecting backup targets from all hosts with postgres). See `tbd/emission-pipeline.md` for the unified emission design.
+- **Shared emission pipeline**: `emit-content` handler iterates content uniformly for both classes and traits. Only the collection target differs (`emit-class` vs `emit-trait`). See `tbd/emission-pipeline.md`.
 
 ### 10.6 Dynamic Trait Schema Registration (Preserved Design)
 
@@ -710,6 +722,28 @@ The following spec files are deleted. Their key design decisions are preserved i
 | `2026-05-01-scope-native-policy-dispatch.md` | policy.resolve.withIncludes API. Shipped. |
 | `2026-05-01-transition-elimination.md` | Core transition elimination. Shipped (-3024 lines). |
 | `2026-05-02-architecture-cleanup.md` | Mechanical dedup, extraction, providerType dispatch. Phases 1-2 shipped. Phase 3a in Section 7.3. |
+
+---
+
+## 13. Phase 7: Effect Architecture Redesign (Planned)
+
+Three specs define the next architectural evolution. These replace the current effect vocabulary with narrow, single-purpose handlers where no handler branches on shape and every decision point is observable.
+
+| Spec | Scope | Key change |
+|------|-------|-----------|
+| `tbd/unified-resolve-effects.md` | Resolution chain | resolve → gate → compile → compile-{forward,conditional,parametric,static}. Bind/defer/drain subsystem. Walker sends `resolve` only. |
+| `tbd/policy-entity-primitives.md` | Policy + entity | dispatch-policies, record-fired, emit-policy-effects, widen-context for iterate. push-scope, restore-scope, propagate-routes for entities. |
+| `tbd/emission-pipeline.md` | Emission + wrapping | Shared emit-content for classes + traits. Lazy trait collection. Class-module wrapping decomposed. |
+
+**Design principles:**
+- Every handler ≤15 lines, single purpose
+- Shape dispatch via pure router (`compile`) — zero logic per branch
+- Identity + ctx flow as payload data through effects
+- Bind subsystem (bind, defer, drain, scope-widened) is self-contained and reactive
+- Lazy trait values resolve via Nix native evaluation, not custom thunk machinery
+- `enterScope` for simple scope entries; explicit `drain` for complex orchestration
+
+**Dependencies:** unified-resolve → policy-entity-primitives → emission-pipeline → trait implementation
 
 ---
 

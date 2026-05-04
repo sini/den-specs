@@ -400,3 +400,105 @@ Quick-reference for each implemented-branch spec against current codebase:
 | Spec | SUMMARY verdict | Current reality |
 |------|----------------|-----------------|
 | transition-elimination | (not in SUMMARY) | Substantially shipped. 629/629 tests. |
+
+---
+
+## Phase 6: Code Simplification Arc (May 4)
+
+### What was done
+
+Multi-pass code simplification and architectural decomposition of the fx-pipeline codebase:
+
+**Structural decomposition (4 commits):**
+- `handlers/tree.nix` (365 lines) → 7 focused handler files (each <70 lines)
+- `policy-dispatch.nix` (646 lines) → `policy/` directory (5 files, largest 189 lines)
+- `include-emit.nix` (406 lines) → `aspect/` directory (3 files + default)
+- `route.nix` (342 lines) → `route/` directory (3 files)
+- `pipeline.nix` fxResolve (148 lines) → `resolve.nix` with phased helpers
+
+**Function decomposition (4 commits):**
+- `wrapClassModule` 111 → 3 focused functions
+- `lateDispatchPass` 62 → 12 lines (emitLateForSibling extracted)
+- `aspectSubmodule` 109 → 56 lines (metaType extracted)
+- `aspectToEffect` 65 → 4 lines (pure dispatch to resolveParametric/compileStatic)
+- `emitClasses` 48 → 12 lines (emitClassKey, emitClassEntry extracted)
+- `resolveChildren` 36 → 10 lines (resolveChildSequence extracted)
+- `emitIncludes` 52 → 26 lines (processInclude, dedupAndDispatch, propagateScope)
+- `classifyKeys` 55 → 18 lines (hasRecognizedSubKeys, isNestedKey extracted)
+- `wrapRouteModules` 64 → 2 lines (nestWithAdaptArgs, nestPlain, nestModule, guardModule, adaptModule promoted)
+- `applyComplexRoute` 57 → 10 lines (getCollectedSource, resolveSourceFallback, appendToClass)
+- `check-constraint` handler 47 → 18 lines (lookupEntries, filterByScope, entryToResume)
+- `iterate` go 58 → 20 lines (recordFired, widenAndContinue extracted)
+
+**Performance optimizations (1 commit):**
+- flatConstraintRegistry: O(N×S×C) → O(N) per check-constraint call
+- flatAspectPolicies: O(S×P) → O(1) per dispatch
+- Reverse-accumulate includes: O(N²) → O(N) consumption
+
+**Worktree experiment (`handler-decomp` branch):**
+- `resolve-schema-entity` decomposed into pushScope, copyDeferredToScope, resolveEntityInScope, propagateRootRoutes (90 → 9 functions, largest 24 lines)
+
+### Results
+
+- No file over 500 lines (max 301, down from 646)
+- 43 files in fx/ (up from 15)
+- Functions >50 lines: ~15 remaining (handler attrsets and irreducible recursion)
+- Functions >20 lines: ~30 (target for next phase)
+- All 634 tests passing throughout
+
+### Lasting consequence
+
+The codebase is now structured by concern:
+```
+fx/
+├── aspect/     (children, normalize, provide)
+├── policy/     (classify, dispatch, apply, schema, iterate)
+├── route/      (wrap, apply)
+├── handlers/   (constraint, chain, class-collector, deferred, policy, route, instantiate, ...)
+├── pipeline.nix, resolve.nix, aspect.nix, class-module.nix, wrap-classes.nix, ...
+```
+
+Coupling is explicit through import signatures. Shared state mutation helpers live in `handlers/state-util.nix`.
+
+---
+
+## Phase 7: Effect Architecture Redesign (Planned)
+
+### Specs
+
+Three specs define the next architectural evolution:
+
+1. **`tbd/unified-resolve-effects.md`** — Unified resolution chain: resolve → gate → compile → compile-{forward, conditional, parametric, static}. Bind/defer/drain subsystem. Eliminates resolve-parametric, resolve-aspect, resolve-conditional, emit-forward, defer-include, drain-deferred effects. Adds 14 new narrow effects.
+
+2. **`tbd/policy-entity-primitives.md`** — Policy iteration and entity resolution as primitive compositions. dispatch-policies, record-fired, emit-policy-effects, widen-context effects for the iterate loop. push-scope, restore-scope, propagate-routes effects for entity resolution.
+
+3. **`tbd/emission-pipeline.md`** — Unified emission for classes and traits. Shared emit-content handler (unwrap → iterate → dispatch). Lazy trait collection (thunks resolve via Nix native laziness). Class-module wrapping decomposed into detectDenArgs, checkMissingArgs, applyDenArgs, buildValidator.
+
+### Design principles
+
+- **Every handler ≤15 lines.** No multi-shape logic in any handler.
+- **No branching in handlers.** Shape dispatch is a pure router (`compile`). Each compile-* handler knows exactly what it received.
+- **Identity + ctx flow as data.** Computed once by the walker, never recomputed.
+- **Bind subsystem is self-contained.** bind, defer, drain, scope-widened form a closed reactive system.
+- **Lazy trait values are just values.** The collector doesn't evaluate — Nix laziness resolves thunks on consumer access.
+- **`enterScope` for simple scope entries, explicit drain for complex orchestration.**
+
+### Key architectural changes
+
+| Current | After |
+|---------|-------|
+| Walker dispatches to 4 effects based on shape | Walker sends `resolve` for everything |
+| `aspectToEffect` function (recursive dispatch) | `resolve` + `compile` effects (handler-driven) |
+| `compileStatic` function (inline orchestration) | `compile-static` → classify + emit-content + resolve-children effects |
+| Inline `state.modify` in iterate | Named effects: dispatch-policies, record-fired, widen-context |
+| `resolve-schema-entity` monolithic handler | push-scope + resolve + drain + propagate-routes composition |
+| `emit-class` only | Shared `emit-content` dispatching to emit-class or emit-trait |
+| Traits as separate future work | Integrated into emission pipeline design (lazy collection) |
+| `drain-deferred` explicit at 2 sites | Automatic via `scope-widened` for simple cases; explicit `drain` for entity resolution |
+
+### Dependencies
+
+- Unified resolve spec can be implemented independently
+- Policy/entity primitives spec depends on unified resolve (uses `resolve` effect)
+- Emission pipeline spec depends on unified resolve (uses `compile-static` and `classify`)
+- Trait implementation depends on emission pipeline spec (uses `emit-content` and `emit-trait`)
