@@ -20,7 +20,7 @@ This data is **NixOS-config-dependent** — it only exists after module evaluati
 
 The den pipeline operates *before* NixOS evaluation. It routes aspects into class modules and resolves policy topology, but it never has access to evaluated `config` values. The pipeline can gate *whether* an aspect is included (via boolean trait flags), but it cannot aggregate *what* a service exports (ports, paths, keys).
 
-The deleted three-tier trait system attempted to solve this by deferring Tier 3 traits to module evaluation time, injecting them via `_den.traits` modules, and distributing cross-entity data through provide-to sub-pipelines. This worked but required ~2463 lines across 23 files, interacted with every pipeline concern, and was architecturally fragile.
+The deleted trait system attempted to solve this by deferring config-dependent trait values to module evaluation time, injecting them via `_den.traits` modules, and distributing cross-entity data through provide-to sub-pipelines. This worked but required ~2463 lines across 23 files, interacted with every pipeline concern, and was architecturally fragile.
 
 The insight: Nix already solves lazy cross-reference evaluation. `nixosConfigurations` is a lazy attrset — accessing one host's config does not force evaluation of another unless there is a true data dependency. We can expose this directly.
 
@@ -180,7 +180,7 @@ These are lightweight — no collection, no cross-host aggregation, no NixOS con
 
 ### Fleet + den.exports (this design)
 
-Handles the data aggregation that the old Tier 3 traits attempted. Instead of a custom distribution phase in the pipeline, it uses Nix's lazy evaluation directly. The pipeline never sees this data — it flows between evaluated NixOS configs at module time.
+Handles the data aggregation that the deleted trait system attempted for config-dependent values. Instead of a custom distribution phase in the pipeline, it uses Nix's lazy evaluation directly. The pipeline never sees this data — it flows between evaluated NixOS configs at module time.
 
 ### When to use which
 
@@ -298,13 +298,13 @@ Handles the data aggregation that the old Tier 3 traits attempted. Instead of a 
 
 ---
 
-## 7. Why This Replaces provide-to and Tier 3 Traits
+## 7. Why This Replaces provide-to and Config-Dependent Traits
 
 The original cross-host data flow in den used:
 
 1. **provide-to effects** — emit data tagged with a target entity during pipeline walk
 2. **distribute-cross-entity** — post-pipeline phase collecting cross-entity emissions and injecting them into target configs
-3. **Tier 3 traits** — trait values that depend on NixOS config, deferred to module evaluation, distributed via `_den.traits` injection modules
+3. **Config-dependent trait values** — trait values requiring NixOS config, deferred to module evaluation, distributed via `_den.traits` injection modules
 
 All three mechanisms existed to solve one problem: getting data from one host's evaluated config into another host's NixOS modules.
 
@@ -313,8 +313,8 @@ All three mechanisms existed to solve one problem: getting data from one host's 
 | Old mechanism | Lines of code | Replacement |
 |---------------|---------------|-------------|
 | provide-to handler + distribute phase | ~400 | `fleet` (one line) |
-| Tier 3 trait evaluation + deferred injection | ~800 | `den.exports` (one option) |
-| Three-tier classification in classifyKeys | ~200 | Eliminated — no tier distinction needed |
+| Deferred trait evaluation + injection | ~800 | `den.exports` (one option) |
+| Classification for deferred values | ~200 | Eliminated — traits are pipeline-time only |
 | Trait inheritance via scope walking | ~300 | Direct `fleet` reads |
 | `traitModuleForScope` injection | ~150 | Standard NixOS module arguments |
 
@@ -422,4 +422,4 @@ If Home Manager evaluates independently (standalone mode), `fleet` must be threa
 | `den.exports` | Freeform option for exportable data | Entity mainModule injection | ~6 |
 | Total | Cross-host data without pipeline involvement | | ~7 lines of framework code |
 
-The pattern leverages Nix's existing laziness guarantees rather than building custom distribution machinery. It is the natural replacement for the deleted Tier 3 trait system and provide-to mechanism, trading ~2800 lines of pipeline-integrated code for ~7 lines of module-system integration.
+The pattern leverages Nix's existing laziness guarantees rather than building custom distribution machinery. It is the natural replacement for the deleted config-dependent trait evaluation and provide-to mechanism, trading ~2800 lines of pipeline-integrated code for ~7 lines of module-system integration.

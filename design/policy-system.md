@@ -93,7 +93,7 @@ Emitted via `register-constraint` with `type = "exclude"`, `scope = "subtree"`. 
 
 ### 2.4 route
 
-Routes class content from one scope partition into a target class. Tier 1 delivery — replaces `den.provides.forward` for the common case:
+Routes class content from one scope partition into a target class. Replaces `den.provides.forward` for the common (route-eligible) case:
 
 ```nix
 policy.route {

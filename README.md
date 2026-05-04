@@ -4,9 +4,9 @@ Design specs for [den](https://github.com/denful/den), a NixOS configuration fra
 
 ## The Story
 
-Den's `feat/fx-pipeline` branch replaced the legacy aspect resolution pipeline with an algebraic effects architecture. The initial implementation introduced scope-partitioned state, typed policy effects, and entity-schema-driven resolution — but accumulated tech debt as each new mechanism (transitions, DLQ, three-tier traits, forward sub-pipelines) interacted with every other. A cleanup arc deleted ~3000 lines by recognizing that `scope.provide` — the effect system's own scoping primitive — could replace most of the manually-built machinery. Transitions became `installPolicies` with lexical `scope.provide`, the DLQ was eliminated in favor of direct class emission, and the entire trait system was removed for a simpler reimplementation.
+Den's `feat/fx-pipeline` branch replaced the legacy aspect resolution pipeline with an algebraic effects architecture. The initial implementation introduced scope-partitioned state, typed policy effects, and entity-schema-driven resolution — but accumulated tech debt as each new mechanism (transitions, DLQ, traits, forward sub-pipelines) interacted with every other. A cleanup arc deleted ~3000 lines by recognizing that `scope.provide` — the effect system's own scoping primitive — could replace most of the manually-built machinery. Transitions became `installPolicies` with lexical `scope.provide`, the DLQ was eliminated in favor of direct class emission, and the trait system was removed for a simpler reimplementation.
 
-The result is a pipeline where policy dispatch, context expansion, and entity resolution are composed from small effect handlers rather than orchestrated by monolithic dispatchers. Scope partitioning gives each entity its own state partition without sub-pipeline isolation. Routes and provides deliver content post-pipeline from those partitions. The remaining work — provides removal, trait reimplementation via a single pipeline tier + fleet/den.exports, and policy scoping — builds on this foundation without requiring further architectural changes.
+The result is a pipeline where policy dispatch, context expansion, and entity resolution are composed from small effect handlers rather than orchestrated by monolithic dispatchers. Scope partitioning gives each entity its own state partition without sub-pipeline isolation. Routes and provides deliver content post-pipeline from those partitions. The remaining work — provides removal, pipeline-time trait reimplementation + fleet/den.exports for cross-host data, and policy scoping — builds on this foundation without requiring further architectural changes.
 
 ## Design Specs (Current Architecture)
 
@@ -25,7 +25,7 @@ These describe the pipeline as it exists today (629/629 tests, PR [#475](https:/
 | Component | Spec | Summary |
 |-----------|------|---------|
 | **Policy System** | [design/policy-system.md](design/policy-system.md) | Policies are plain functions from context to typed effects. Seven effect types (resolve, include, exclude, route, provide, instantiate, pipelineOnly). `installPolicies` dispatches via signature matching with enrichment iteration to fixpoint. Three registries: global, schema-scoped, aspect-included. |
-| **Routes & Forwards** | [design/routes-and-forwards.md](design/routes-and-forwards.md) | `policy.route` reads from scope partitions and delivers class content to target classes via `wrapRouteModules`. `policy.provide` delivers new content directly. Tier 2 forwards (adapter modules, dynamic paths) survive for advanced cases. Forward scope isolation propagates root specs to child scopes with filtered fallback. |
+| **Routes & Forwards** | [design/routes-and-forwards.md](design/routes-and-forwards.md) | `policy.route` reads from scope partitions and delivers class content to target classes via `wrapRouteModules`. `policy.provide` delivers new content directly. Complex forwards (adapter modules, dynamic paths) survive for advanced cases. Forward scope isolation propagates root specs to child scopes with filtered fallback. |
 | **Constraint System** | [design/constraint-system.md](design/constraint-system.md) | `register-constraint` / `check-constraint` handler pair manages excludes, filters, and substitutions. `meta.handleWith` and `meta.excludes` install subtree-scoped constraints. Substitute type is vestigial (provides era). Planned evolution: constraints become policy effects via includes/excludes. |
 
 ### Class & Type System
@@ -44,8 +44,8 @@ These describe the pipeline as it exists today (629/629 tests, PR [#475](https:/
 
 | Component | Spec | Summary |
 |-----------|------|---------|
-| **Traits** | [design/traits.md](design/traits.md) | Semantic data channels collected across aspects. Simplified to one pipeline tier (static + parametric collapse under `scope.provide`). Schema registry (`den.traits`) with collection strategies. `{ traitName, ... }:` consumption in discriminators and class modules. ~250 lines estimated, 10x simpler than the deleted implementation. |
-| **Fleet + den.exports** | [design/fleet-and-exports.md](design/fleet-and-exports.md) | Cross-host data via lazy `fleet` attrset of evaluated NixOS configs + `den.exports` freeform option. Replaces the original provide-to mechanism and Tier 3 traits. Uses Nix laziness directly — no pipeline involvement, no custom distribution phase. |
+| **Traits** | [design/traits.md](design/traits.md) | Semantic data channels collected across aspects at pipeline time. `scope.provide` resolves parametric values before collection — no classification needed. Schema registry (`den.traits`) with collection strategies. `{ traitName, ... }:` consumption in discriminators and class modules. ~250 lines estimated, 10x simpler than the deleted implementation. |
+| **Fleet + den.exports** | [design/fleet-and-exports.md](design/fleet-and-exports.md) | Cross-host data via lazy `fleet` attrset of evaluated NixOS configs + `den.exports` freeform option. Replaces the original provide-to mechanism and config-dependent trait values. Uses Nix laziness directly — no pipeline involvement, no custom distribution phase. |
 
 ## Reference Documents
 

@@ -189,11 +189,11 @@ This is the mechanism that makes `{ host, config, ... }: ...` class modules work
 
 `policy.route` specs are applied per-scope. Each route reads source content from `wrappedPerScope.${route.sourceScopeId}.${route.fromClass}` and injects it into the target class via `wrapRouteModules` (path nesting + optional guard + optional adaptArgs).
 
-Routes apply before forwards. This ordering matters because Tier 2 forwards may read from post-route data.
+Routes apply before forwards. This ordering matters because complex forwards may read from post-route data.
 
 ### Step 3: Forward application
 
-Remaining `forwardSpecs` (Tier 2 forwards that couldn't be expressed as routes) are applied per-scope. Each forward reads from the scope partition's class imports. No sub-pipelines: `buildForwardAspect` reads already-collected modules from `wrappedPerScope.${scopeId}`.
+Remaining `forwardSpecs` (complex forwards that couldn't be expressed as routes) are applied per-scope. Each forward reads from the scope partition's class imports. No sub-pipelines: `buildForwardAspect` reads already-collected modules from `wrappedPerScope.${scopeId}`.
 
 **Forward scope isolation.** Forwards from child scopes need access to root-scope content (e.g., `den.default` modules). The implementation uses filtered root fallback: only `@default` identity modules from the root scope are visible to child-scope forwards. This prevents child scopes from seeing all root content while still providing shared defaults.
 
@@ -255,8 +255,8 @@ The original scope-partitioned pipeline state spec (2026-04-29) described a larg
 **Removed because:** Simplification. Not used by any pipeline logic. Can be reintroduced as part of structured tracing if needed.
 
 ### Trait state fields (scopedTraits, scopedDeferredTraits, scopedConsumedTraits, traitSchemas)
-**Original:** Full three-tier trait system with schema-driven classification, per-scope trait collection, deferred traits for Tier 3 delivery, consumed-trait tracking for `partialOk` validation, and dynamic trait schema registration.
-**Removed because:** The trait system (-2463 lines across 23 files) was deleted as pre-work for the transition elimination redesign. Traits interacted with every pipeline concern (DLQ, transitions, dispatch, forwards). Removing them enabled the cleanup arc's simplifications. Reimplementation is planned via fleet + `den.exports`, on a simpler foundation (no DLQ, no transition boundaries, scope inheritance instead of provide-to).
+**Original:** Trait system with schema-driven classification, per-scope trait collection, deferred trait evaluation, consumed-trait tracking for `partialOk` validation, and dynamic trait schema registration.
+**Removed because:** The trait system (-2463 lines across 23 files) was deleted as pre-work for the transition elimination redesign. Traits interacted with every pipeline concern (DLQ, transitions, dispatch, forwards). Removing them enabled the cleanup arc's simplifications. Reimplementation planned as pipeline-time-only traits (see `design/traits.md`) + fleet/`den.exports` for config-dependent cross-host data (see `design/fleet-and-exports.md`).
 
 ### Dead letter queue (scopedDeadLetterQueue, drain-dead-letters)
 **Original:** Unregistered keys queued as dead letters, reclassified when schemas registered later.

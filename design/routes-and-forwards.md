@@ -41,8 +41,8 @@ In `nix/lib/aspects/fx/route.nix`, `applyRoutes` runs after pipeline execution:
 2. Deduplicates adapter routes by `adapterKey@scopeId`.
 3. Suppresses root-scope specs when child-scope copies exist (scope isolation).
 4. Folds over the route list, branching on `route.__complexForward`:
-   - **Simple routes** (Tier 1): reads `wrappedPerScope.${sourceScopeId}.${fromClass}`, wraps via `wrapRouteModules`, appends to `classImports.${intoClass}`.
-   - **Complex routes** (`__complexForward = true`): uses `buildForwardAspect` with full adapter/guard machinery, can resolve external sources via `fxResolve` sub-call.
+   - **Simple routes** (route-eligible): reads `wrappedPerScope.${sourceScopeId}.${fromClass}`, wraps via `wrapRouteModules`, appends to `classImports.${intoClass}`.
+   - **Complex routes** (`__complexForward = true`, adapter-requiring): uses `buildForwardAspect` with full adapter/guard machinery, can resolve external sources via `fxResolve` sub-call.
 
 ---
 
@@ -69,7 +69,7 @@ Each source module passes through three stages (applied right-to-left in the map
 
 ### Adapter route variant
 
-For routes with `adapterKey != null` (forward-derived Tier 2), `applyRoutes` skips `wrapRouteModules` and instead emits a functor module:
+For routes with `adapterKey != null` (adapter-requiring forwards), `applyRoutes` skips `wrapRouteModules` and instead emits a functor module:
 ```nix
 {
   __functionArgs = guardArgs // intoPathArgs // adaptArgv;
@@ -106,13 +106,13 @@ Deduplication: keyed by `"${policyName}/${class}/${path}"` to prevent identical 
 |----------|-----------|
 | Move already-collected pipeline content between classes | `policy.route` |
 | Inject new content that was never walked by the pipeline | `policy.provide` |
-| Adapter modules, dynamic paths, list-dedup options | Tier 2 forward (via `den.provides.forward`) |
+| Adapter modules, dynamic paths, list-dedup options | Complex forward (via `den.provides.forward`) |
 
 ---
 
-## 4. Tier 2 Forwards: What They Are and Why They Exist
+## 4. Complex Forwards: What They Are and Why They Exist
 
-Tier 2 forwards are complex routing operations that `policy.route` cannot express. They use `den.provides.forward` / `forwardItem` and produce aspects with `meta.__forward` markers that the pipeline emits via `"emit-forward"`.
+Complex forwards are routing operations that `policy.route` cannot express. They use `den.provides.forward` / `forwardItem` and produce aspects with `meta.__forward` markers that the pipeline emits via `"emit-forward"`.
 
 ### Why they still exist
 
@@ -124,7 +124,7 @@ Tier 2 forwards are complex routing operations that `policy.route` cannot expres
 
 4. **mapModule transformations**: Pre-processing source modules before injection (used by `home-env.nix`).
 
-### Current Tier 2 users
+### Current complex forward users
 
 - `home-env.nix` (`makeHomeEnv`): home-manager, hjem, maid integration
 - User-defined custom forwards with adapter modules
@@ -160,10 +160,10 @@ This ensures shared infrastructure (den.default aspect) is available in child sc
 
 ## 6. Forward Auto-Detection (Planned, Not Implemented)
 
-The `forwardHandler` in `handlers/forward.nix` already classifies forwards into Tier 1 vs complex:
+The `forwardHandler` in `handlers/forward.nix` already classifies forwards into route-eligible vs complex:
 
 ```nix
-isTier1 = isSimpleSpec && sourceIsLocal && sourceAlreadyCollected;
+isRouteEligible = isSimpleSpec && sourceIsLocal && sourceAlreadyCollected;
 ```
 
 Where:
@@ -171,7 +171,7 @@ Where:
 - `sourceIsLocal`: no `__scopeHandlers` on source aspect (same entity)
 - `sourceAlreadyCollected`: source class exists in current scope's `scopedClassImports`
 
-When all three conditions hold, the forward is stored as a simple route shape (no `__complexForward` marker). This automatic classification means users writing simple `den.provides.forward` entries get Tier 1 route performance without migration.
+When all three conditions hold, the forward is stored as a simple route shape (no `__complexForward` marker). This automatic classification means users writing simple `den.provides.forward` entries get route performance without migration.
 
 The **planned but unimplemented** extension: allowing users to write `den.provides.forward` with simple specs and having the system transparently convert them to `policy.route` effects at the policy level. Currently this happens at the handler level (post-emit), not at the API level.
 
@@ -183,8 +183,8 @@ On feat/fx-pipeline, the legacy `provides.os-class`, `provides.os-user`, and `pr
 
 | Legacy forward | Replacement mechanism |
 |---|---|
-| `os-class.nix` (os -> nixos/darwin) | Tier 1 auto-detection: forward with `fromClass = "os"`, `intoClass = host.class`, `path = []` classifies as simple route |
-| `os-user.nix` (user -> OS class) | Part of `makeHomeEnv` Tier 2 forward: uses `forwardPathFn`, `resolveEntity`, adapter machinery |
+| `os-class.nix` (os -> nixos/darwin) | Auto-detected as route-eligible: forward with `fromClass = "os"`, `intoClass = host.class`, `path = []` classifies as simple route |
+| `os-user.nix` (user -> OS class) | Part of `makeHomeEnv` complex forward: uses `forwardPathFn`, `resolveEntity`, adapter machinery |
 | `wsl.nix` (wsl -> OS) | Forward with guard, path nesting: classifies as complex route with `guardFn` |
 | `provides.to-hosts` / `provides.to-users` | `provides-compat.nix` shim: translates to `policy.include` effects via aspect policies |
 
@@ -239,7 +239,7 @@ The critical ordering invariant: **provides before routes**. Complex forward-der
 | File | Role |
 |------|------|
 | `nix/lib/aspects/fx/route.nix` | `wrapRouteModules`, `applyRoutes` |
-| `nix/lib/aspects/fx/handlers/forward.nix` | `forwardHandler` (emit-forward), `buildForwardAspect`, Tier 1 auto-detect |
+| `nix/lib/aspects/fx/handlers/forward.nix` | `forwardHandler` (emit-forward), `buildForwardAspect`, route-eligible auto-detect |
 | `nix/lib/aspects/fx/handlers/provide.nix` | `provideHandler` (register-provide) |
 | `nix/lib/aspects/fx/handlers/tree.nix` | `registerRouteHandler` (register-route) |
 | `nix/lib/aspects/fx/pipeline.nix` | `fxResolve` orchestration, application sequence |
@@ -247,5 +247,5 @@ The critical ordering invariant: **provides before routes**. Complex forward-der
 | `nix/lib/policy-effects.nix` | `policy.route`, `policy.provide` constructors |
 | `nix/lib/aspects/fx/policy-dispatch.nix` | Policy dispatch, effect classification, `policyEmitEffects` |
 | `nix/lib/aspects/fx/handlers/provides-compat.nix` | Legacy provides.to-hosts/to-users shim |
-| `nix/lib/home-env.nix` | `makeHomeEnv` (Tier 2 forward example) |
+| `nix/lib/home-env.nix` | `makeHomeEnv` (complex forward example) |
 | `nix/lib/aspects/fx/wrap-classes.nix` | `wrapCollectedClasses` (post-pipeline module wrapping) |

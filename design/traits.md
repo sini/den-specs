@@ -150,7 +150,7 @@ traitCollectorHandler = {
 
 **State field:** `scopedTraits` is thunk-wrapped (`_: value`) to survive `builtins.deepSeq` on the trampoline, matching the pattern used for `scopedClassImports` and other accumulated state.
 
-**No tier detection in the collector.** Unlike the original design's three-tier model, the simplified pipeline has ONE tier: pipeline-time. All trait values are resolved at pipeline time. Static values are collected directly. Parametric values (`{ host, ... }: { ports = [...]; }`) are resolved via `scope.provide` context before reaching the collector — the parametric resolution in `compileStatic` / `bind.fn` handles this before the `emit-trait` effect fires. There is no Tier 3 (module-evaluated) in this design; that use case is handled by fleet + `den.exports` (Section 9).
+**No tier detection in the collector.** All trait values are resolved at pipeline time. Static values are collected directly. Parametric values (`{ host, ... }: { ports = [...]; }`) are resolved via `scope.provide` context before reaching the collector — `bind.fn` handles parametric resolution before the `emit-trait` effect fires. Values requiring NixOS config (`config`, `pkgs`) cannot be traits — that use case is handled by fleet + `den.exports` (Section 9). A trait value with module-system args is an error, not a deferred evaluation.
 
 ### 4.3 Collection Strategy Application
 
@@ -252,7 +252,7 @@ den.aspects.hardened-server = {
 };
 ```
 
-Both parametric discriminators and class modules use `{ traitName, ... }:`. The difference is when they run: discriminators at pipeline time, class modules at eval time. Data is the same — there is no tier distinction in the simplified design.
+Both parametric discriminators and class modules use `{ traitName, ... }:`. The difference is when they run: discriminators at pipeline time, class modules at eval time. Data is the same — trait data collected at pipeline time is available to both consumers via the same path.
 
 ## 6. Dynamic Registration: `register-trait-schema` Effect
 
@@ -361,21 +361,11 @@ resolveChildren order (in aspect.nix):
 
 ## 9. What Fleet + `den.exports` Handles Instead
 
-The original traits spec described three evaluation tiers:
+The original traits spec attempted to handle config-dependent data (functions requiring `config`, `pkgs`, `lib`) within the trait system via deferred evaluation and `_den.traits` injection modules. This created significant complexity (self-referential recursion guards, `partialOk` validation, mixed-arg pre-application, thunk management) for a use case that has a simpler solution.
 
-| Tier | Original scope | Simplified design |
-|------|---------------|-------------------|
-| **1. Static** | Pipeline-time plain values | Traits (this spec) |
-| **2. Pipeline-parametric** | Pipeline-time functions of den context | Traits (this spec) — resolved via `scope.provide` before emission |
-| **3. Module-evaluated** | Inside `evalModules` fixpoint | Fleet + `den.exports` (separate system) |
+**Traits are pipeline-time only.** Values requiring NixOS config are not traits — they are module-system concerns. The pipeline cannot resolve `config` args, so these values cannot drive pipeline-time decisions and cannot participate in trait collection.
 
-**Why Tier 3 is out of scope.** Module-evaluated data (functions requiring `config`, `pkgs`, `lib`) cannot drive pipeline-time decisions. The original design injected Tier 3 data into `_den.traits` via a generated module, creating complexity around:
-- Self-referential recursion guards
-- `partialOk` validation (pipeline consumer + deferred emitter = error)
-- Mixed-arg pre-application in `wrapClassModule`
-- Thunk management across the trampoline
-
-Fleet + `den.exports` handles this case more naturally:
+**Fleet + `den.exports` handles config-dependent cross-entity data** more naturally:
 
 ```nix
 # Host exports NixOS-config-dependent data:
@@ -440,13 +430,13 @@ Based on the original implementation (which shipped and passed 633 tests before 
 - **Phase 3:** ~80 lines (traitArgHandler, wrapClassModule update, injection module, inheritance)
 - **Total:** ~250 lines, vs ~2463 lines in the original implementation
 
-The reduction comes from: no DLQ (~178 lines), no provide-to unification (~400+ lines), no Tier 3 deferred evaluation (~300+ lines), no transition handler interaction (~200+ lines), no separate dispatch-policies interaction (~300+ lines), simpler scope model (scope.provide eliminates stack management).
+The reduction comes from: no DLQ (~178 lines), no provide-to unification (~400+ lines), no deferred evaluation (~300+ lines), no transition handler interaction (~200+ lines), no separate dispatch-policies interaction (~300+ lines), simpler scope model (scope.provide eliminates stack management).
 
 ## Design Decisions
 
-### D1. One pipeline tier, not three
+### D1. Pipeline-time only, no deferred evaluation
 
-The original design detected three tiers via `builtins.functionArgs`: static (plain values), pipeline-parametric (den context args only), and module-evaluated (has `config`/`pkgs`/etc.). The simplified pipeline collapses tiers 1 and 2 — `scope.provide` resolves parametric functions before they reach `emit-trait`, so the collector only ever sees resolved values. Tier 3 is handled by fleet + `den.exports` (Section 9).
+The original design classified trait values into three evaluation tiers. The simplified pipeline eliminates this classification entirely — `scope.provide` resolves parametric functions before they reach `emit-trait`, so the collector only ever sees resolved values. Values requiring module-system args (`config`, `pkgs`) are errors, not deferred evaluations — use fleet + `den.exports` instead.
 
 This eliminates: tier detection logic, `deferredTraits` state, `partialOk` validation, `consumedTraits` tracking, and the `_den.traits` injection module's dual-source merge. The `traitCollectorHandler` becomes ~30 lines instead of ~80.
 
@@ -468,7 +458,7 @@ The collector always appends to a list. Strategy application (`list` concat, `ma
 
 ### D6. `traitArgHandler` reads live state, not snapshots
 
-The original implementation identified a bug where `traitCollectorHandler` captured root `ctx` at construction time, causing stale context for Tier 2 resolution. The fix — reading from `state.scopeContexts.${currentScope}` inside the handler body — applies equally to `traitArgHandler`. It reads `state.scopedTraits` at each invocation, so consumers see all data collected up to that point in the walk.
+The original implementation identified a bug where `traitCollectorHandler` captured root `ctx` at construction time, causing stale context for parametric resolution. The fix — reading from `state.scopeContexts.${currentScope}` inside the handler body — applies equally to `traitArgHandler`. It reads `state.scopedTraits` at each invocation, so consumers see all data collected up to that point in the walk.
 
 ### D7. Dynamic registration is optional, not primary
 
