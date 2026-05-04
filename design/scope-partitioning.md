@@ -269,3 +269,29 @@ The original scope-partitioned pipeline state spec (2026-04-29) described a larg
 ### Dual-write pattern
 **Original:** All emission handlers wrote to both flat state (e.g., `classImports`) and scoped partitions (e.g., `scopedClassImports`). The flat fields were for backward compatibility during migration.
 **Removed because:** `fxResolve` reads exclusively from scoped partitions. Flat fields are not needed. Single-write to scoped partitions only.
+
+---
+
+## 8. Planned Redesign: Scope-Widened Effect
+
+**Spec:** `design/unified-resolve-effects.md`
+
+### New State Fields
+
+| Field | Init | Description |
+|-------|------|-------------|
+| `flatConstraintRegistry` | `{}` | Pre-merged flat view of all constraint entries (O(1) lookup per check) |
+| `flatConstraintFilters` | `[]` | Pre-merged flat filter list |
+| `flatAspectPolicies` | `{}` | Pre-merged flat aspect policy map |
+
+These flat caches are maintained incrementally by `register-constraint` and `register-aspect-policy` handlers, eliminating O(S) cross-scope merges on every check/dispatch call.
+
+### Drain Mechanism Change
+
+- **Current:** `drain-deferred` is an explicit effect sent at two call sites (resolve-schema-entity, policy/iterate).
+- **After redesign:** `drain` replaces `drain-deferred` (same semantics). Additionally, `scope-widened` provides automatic drain for simple scope entries via `enterScope` wrapper.
+- **Entity resolution:** Retains explicit `drain` at its specific orchestration point. Does NOT use `enterScope`.
+
+### Sync Invariant (Section 6) — Unchanged
+
+The `scope.provide` / `state.modify` sync invariant is preserved. `enterScope` wraps `scope.provide` and emits `scope-widened` inside the new scope (after handlers are installed). The `scope-widened` handler reads state that was already updated by `pushScope` (which runs before `scope.provide`).

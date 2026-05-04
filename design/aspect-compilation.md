@@ -288,3 +288,31 @@ Translates `provides.${name}` into an include. When an aspect named `"foo"` has 
 Translates `provides.to-users`, `provides.to-hosts`, and named provides targets (`provides.myhost`) into aspect-scoped policies via `"register-aspect-policy"`. Each emits a deprecation warning. The target state is for aspects to use `aspect.policies` with explicit `policy.include` effects.
 
 Both are slated for removal once the 114 template `provides` occurrences are migrated (see provides removal plan).
+
+---
+
+## 10. Planned Redesign: Unified Resolve Effects
+
+**Spec:** `design/unified-resolve-effects.md`
+
+The current five-effect resolution vocabulary (`resolve-aspect`, `resolve-parametric`, `resolve-conditional`, `check-dedup`, `check-constraint`) will be refactored to a unified model:
+
+### Effects Replaced
+
+- `resolve-parametric` + `resolve-aspect` → unified `resolve` effect
+- `defer-include` → `defer` effect (with resolve-complete stub emission)
+- `drain-deferred` → `drain` effect (explicit) + `scope-widened` (automatic for simple cases)
+- Direct `compileStatic` call → `classify` + `emit-classes` + `resolve-children` effects
+
+### Key Changes to This Document
+
+- **Section 1** (aspectToEffect): The function is eliminated. Callers send `fx.send "resolve"` instead. The `resolve` handler contains the parametric/static dispatch.
+- **Section 2** (compileStatic): Logic moves into the `resolve` handler's static path, decomposed into `classify`, `emit-classes`, and `resolve-children` effects.
+- **Section 3** (resolveChildren): Becomes the `resolve-children` handler. Receives `chainIdentity` + `identity` in payload.
+- **Section 4.3** (classification dispatch): Walker sends `resolve` for all non-forward, non-conditional children. No `isParametric` check.
+- **Section 5.1-5.2** (resolve-aspect, resolve-parametric): Deleted. Unified into `resolve` handler.
+- **Section 7** (deferred includes): The `bind` handler probes scope (via `fx.effects.hasHandler`), and on failure sends `defer`. Drain is automatic via `scope-widened` for simple scope entries, explicit for entity resolution.
+
+### Design Invariant
+
+Identity + ctx flow as payload data through the effect chain — handlers never call `identity.key` or `ctxFromHandlers` internally.

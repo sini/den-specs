@@ -13,15 +13,15 @@ This document consolidates 16 design specs written during the second half of the
 - The architectural transformation from the fx-pipeline midpoint to present
 - Design invariants and constraints that future work must respect
 - A component inventory mapping midpoint → current state
-- Immediate next work (provides removal)
-- Follow-up work (forward elimination, aspect key type, cleanup)
+- Provides as permanent API (Section 5, updated 2026-05-04)
+- Next work (forward elimination, aspect key type, cleanup)
 - A vestigial code audit identifying suspected dead paths
 - Policy scoping and activation redesign (registry vs activation, meta.handleWith → policy methods)
 - Future traits reimplementation via fleet + den.exports
 
 **What this document does NOT cover:** The initial main→fx-pipeline transformation (replacing the legacy eager resolver with algebraic effects, introducing the four-concern model, etc.) is a larger story documented elsewhere. This spec starts from the point where the fx-pipeline already had effects, scope partitioning, transitions-as-effects, traits, DLQ, and forward sub-pipelines — and documents the cleanup that simplified all of that into the current architecture.
 
-This document supersedes 15 of the 16 prior specs in `docs/superpowers/specs/`. Those files are deleted upon adoption of this document. The 16th — `2026-04-27-provides-removal-post-unified-effects.md` — is retained as the standalone execution spec for provides removal (Section 5).
+This document supersedes 15 of the 16 prior specs in `docs/superpowers/specs/`. Those files are deleted upon adoption of this document. The 16th — `2026-04-27-provides-removal-post-unified-effects.md` — is retained for historical reference (superseded 2026-05-04: provides is a permanent API).
 
 ---
 
@@ -254,170 +254,98 @@ Root-scope forward specs must be propagated to child scopes **during the pipelin
 
 ---
 
-## 5. What Comes Next: Provides Removal (Immediate)
+## 5. Provides: Permanent API, New Internals
 
-**Standalone execution spec:** `2026-04-27-provides-removal-post-unified-effects.md` (cleaned up)
+~~**Previous plan:** Remove `provides` entirely, migrate templates to `policies.X`.~~
 
-The `provides` structural key has no remaining purpose. All `provides.X` patterns are handled by policies or the provides-compat shim. Removing provides eliminates the compat shim and simplifies the pipeline.
+**Corrected understanding:** `provides.to-users`, `provides.to-hosts`, and `provides.<name>` are established user-facing APIs for cross-entity content delivery. Users depend on them. They must remain as first-class API targets.
 
-### 5.1 What Gets Deleted
+### 5.1 What Changed
 
-**Pipeline machinery:**
+The legacy transition system that originally powered provides has been eliminated. The provides→policy translation is now folded into `emitAspectPolicies` as a first-class pipeline feature. New users should use policies and direct nesting; existing `provides`/`_` patterns continue working unchanged.
 
-| Component | File | Lines |
-|-----------|------|-------|
-| `emitSelfProvide` | `include-emit.nix` | ~51 |
-| `mkPositionalInclude` | `include-emit.nix` | ~30 |
-| `mkNamedInclude` | `include-emit.nix` | ~30 |
-| `emitCrossProvideShims` call | `aspect.nix` resolveChildren | ~2 |
+### 5.2 What Stays (User API)
 
-**Compat handler:**
+| Component | File | Status |
+|-----------|------|--------|
+| `provides` option on `aspectSubmodule` | `types.nix` | **Permanent** — user-facing API |
+| `_` alias (`mkAliasOptionModule`) | `types.nix` | **Permanent** — ergonomic shorthand |
+| `"provides"` in `structuralKeysSet` | `key-classification.nix` | **Permanent** — prevents dispatch as class key |
 
-| Component | File | Lines |
-|-----------|------|-------|
-| `provides-compat.nix` | `handlers/provides-compat.nix` | 132 |
-| import line | `handlers/default.nix` | 1 |
-| `emitCrossProvideShims` import | `aspect.nix` | 1 |
+### 5.3 What Changes (Internals)
 
-**Type system:**
+| Component | File | Change |
+|-----------|------|--------|
+| `provides-compat.nix` | `handlers/provides-compat.nix` | **Deleted** — functionality folded into `emitAspectPolicies` |
+| `emitCrossProvideShims` | `aspect.nix` | **Deleted** — separate phase removed from `resolveChildren` |
+| `emitSelfProvide` | `include-emit.nix` | **Deleted** — self-provide folded into `emitAspectPolicies` as auto-include |
+| `emitAspectPolicies` | `include-emit.nix` | **Modified** — now handles `policies.*` AND `provides.*` in one phase |
 
-| Component | File |
-|-----------|------|
-| `provides` option on `aspectSubmodule` | `types.nix:395` |
-| `_` alias (`mkAliasOptionModule ["_"] ["provides"]`) | `types.nix:318` |
-| `"provides"` in `structuralKeysSet` | `key-classification.nix:14` |
+See `2026-05-04-provides-cleanup-design.md` for the full design spec.
 
-**Support files:**
+### 5.4 Impact on Dependency Chain
 
-| Component | File |
-|-----------|------|
-| `resolveWithProvidesFallback` | `den-brackets.nix` |
-| `mutual-provider-shim.nix` | `modules/compat/mutual-provider-shim.nix` — evaluate if still needed after provides removal. If mutual-provider patterns are fully migrated to policies, this compat shim can be deleted. |
+The original dependency chain gated constraint cleanup, providerType dispatch, and aspect key type on provides removal. Since provides is not being removed, those items are **independently implementable**:
 
-### 5.2 Template Migration
+- Constraint handler simplification (Section 7.2) — `substitute` type is vestigial regardless of provides
+- providerType dispatch (Section 7.3) — can proceed with provides in place
+- Aspect key type (Section 8) — independent of provides
 
-All `provides.X` writes in templates become aspect-included policies:
+### 5.5 `den.provides.*` Factory Namespace
 
-```nix
-# Before:
-den.aspects.igloo.provides.to-users = { user, ... }: {
-  homeManager.programs.direnv.enable = true;
-};
-
-# After:
-den.aspects.igloo.policies.to-users = { host, user, ... }:
-  [ (den.lib.policy.include { homeManager.programs.direnv.enable = true; }) ];
-```
-
-Targeted cross-provides become guarded policies:
-
-```nix
-# Before:
-den.aspects.igloo.provides.alice = { homeManager.programs.vim.enable = true; };
-
-# After:
-den.aspects.igloo.policies.to-alice = { host, user, ... }:
-  lib.optional (user.name == "alice")
-    (den.lib.policy.include { homeManager.programs.vim.enable = true; });
-```
-
-**Note:** `den.provides.*` (the factory namespace — `den.provides.forward`, `den.provides.define-user`, etc.) is NOT the aspect-level `provides` structural key. The factory namespace is unaffected.
-
-### 5.3 resolveChildren Simplification
-
-Current:
-```
-emitSelfProvide → emitCrossProvideShims → emitAspectPolicies → emitIncludes → installPolicies
-```
-
-After:
-```
-emitAspectPolicies → emitIncludes → installPolicies
-```
-
-### 5.4 Execution Steps
-
-```
-1. Migrate provides.X patterns in templates → policies.X (~35 files)
-2. Delete provides-compat.nix + emitCrossProvideShims call
-3. Delete emitSelfProvide + mkPositionalInclude + mkNamedInclude
-4. Simplify resolveChildren (remove selfProvide + compat phases)
-5. Remove provides option + _ alias from types.nix
-6. Remove "provides" from structuralKeysSet
-7. Clean up den-brackets.nix provides fallback
-8. Verify substituteChild in include-emit.nix — delete if unused outside provides
-9. Run full CI
-```
-
-### 5.5 Related Vestigial Items
-
-- `substituteChild` in `include-emit.nix:122` — only reachable via `check-constraint` substitute path, which was a provides-era mechanism. Verify no non-provides callers remain after deletion.
-- `"substitute"` type in `constraints.nix:26-42` — dead after provides removal. The constraint registry simplifies to exclude + filter only.
-
-### 5.6 Impact
-
-| Metric | Value |
-|--------|-------|
-| Lines deleted | ~280 (pipeline + compat + types) |
-| Files deleted | 1 (provides-compat.nix) |
-| Files modified | ~7 (aspect.nix, include-emit.nix, types.nix, key-classification.nix, den-brackets.nix, handlers/default.nix, constraints.nix) |
-| Template files migrated | ~35 |
-| Concepts removed | provides structural key, self-provide, cross-provide shims, mutual-provider compat |
+The `den.provides` top-level namespace (`den.provides.forward`, `den.provides.define-user`, etc.) is the **factory registry** — NOT the aspect-level `provides` structural key. It is unaffected and also permanent.
 
 ---
 
-## 6. What Comes Next: Forward Elimination
+## 6. Forward Elimination — COMPLETE (verified 2026-05-04)
 
-With provides removal complete, the forward system can be further simplified. Currently forwards use sub-pipeline-style source resolution for Tier 2 cases (adapter modules). The goal is to eliminate as much forward infrastructure as possible.
+All forward elimination items are implemented. The forward system has two tiers: Tier 1 (simple forwards auto-classified as routes) and Tier 2 (adapter/guard forwards using `buildForwardAspect`). Both are handled uniformly by `applyRoutes` in `route.nix`.
 
-### 6.1 policy.instantiate for Entity Outputs
+### 6.1 policy.instantiate for Entity Outputs — COMPLETE
 
-Entity output wiring (osConfigurations, hmConfigurations) is already handled by flake policies. The `policy.instantiate` effect exists in the API. What remains is verifying that the current flake policy implementation fully replaces the deleted output modules.
+Old output modules (`osConfigurations.nix`, `hmConfigurations.nix`, `flakeSystemOutputs.nix`) deleted. Flake policies in `modules/policies/flake.nix` handle all wiring via `policy.resolve.to`, `policy.route`, and `policy.instantiate`.
 
-**Status:** The output modules (`osConfigurations.nix`, `hmConfigurations.nix`, `flakeSystemOutputs.nix`) are already deleted. Flake policies in `modules/policies/flake.nix` handle output wiring via `policy.resolve.to`, `policy.route`, and `policy.instantiate`. This is complete.
+### 6.2 Forward Auto-Detection — COMPLETE
 
-### 6.2 Forward Auto-Detection
+`forwardHandler` in `handlers/forward.nix` classifies forwards at handler time:
+- **Tier 1** (`isTier1`): `canDirectImport && !needsAdapter && !evalConfig && sourceIsLocal && sourceAlreadyCollected` → stored as simple route shape
+- **Tier 2**: everything else → stored with `__complexForward = true`
 
-Simple forwards (`!(spec ? adapterModule) && !(spec ? mapModule) && builtins.isList (spec.intoPath or [])`) can be auto-classified as `policy.route` internally. This means `den.provides.forward` silently routes Tier 1 cases through routes — zero user migration needed.
+Both tiers go into `scopedRoutes`. Users writing simple `den.provides.forward` get route performance with zero migration.
 
-**Status:** Not yet implemented. The `emit-forward` handler in `handlers/forward.nix` currently registers all forwards as forward specs. Adding auto-detection requires checking the spec shape and emitting `register-route` instead of `register-forward` for simple cases.
+### 6.3 Scope-Prefixed Dedup Keys — COMPLETE
 
-### 6.3 Scope-Prefixed Dedup Keys
+- `includeSeen`: scope-prefixed in `check-dedup.nix` (`"${scope}/${rawDedupKey}"`)
+- `ctxSeen`: scope-prefixed in `ctx.nix` (`"${scope}/${key}"`)
 
-Deferred from the scope partitioning spec. `ctxSeen` and `includeSeen` need scope-prefixed keys for correct inline-walk of Tier 2 forward sources. Without this, an aspect included in both the parent walk and the forward source would be incorrectly dedup'd.
+### 6.4 Flat State Field Removal — COMPLETE
 
-**Status:** `includeSeen` is scope-aware (shipped). `ctxSeen` (`state.seen` in ctx handler) is NOT scope-prefixed — still uses the old format. Verify whether this matters for remaining Tier 2 forwards.
+`scopedClassImports` is the sole source of truth during the walk. No flat `classImports` state field exists. The `emit-class` handler writes only to `scopedClassImports`. Post-pipeline flattening in `fxResolve` is a local variable, not state. `applyForwardSpecs` no longer exists — logic inlined into `applyRoutes`.
 
-### 6.4 Flat State Field Removal
+### 6.5 Tier 2 Forward Simplification — STABLE
 
-Once fxResolve reads exclusively from scoped partitions, flat state fields (dual-writes) can be removed. Currently both flat and scoped fields are maintained during the walk.
+Tier 2 forwards (adapter modules, dynamic paths) stay as-is. Real-world cases:
+- **Niri adapter**: option schema extension via `types.submoduleWith`
+- **Persist adapter**: `apply = lib.unique` for dedup
+- **home-env.nix** (`makeHomeEnv`): home-manager/hjem/maid integration
 
-**Status:** Blocked on forward auto-detection. Flat `classImports` is still read by root-scope-aggregate forwards in `applyForwardSpecs`.
+`den.provides.forward` remains the API for these cases. The infrastructure works correctly.
 
-### 6.5 Tier 2 Forward Simplification
-
-Tier 2 forwards (adapter modules, dynamic paths) cannot become `policy.route` because they need `buildForwardAspect`'s adapter machinery. Two real-world cases:
-- **Niri adapter**: Declares OPTIONS for list-merging. This is option schema extension, not just collection strategy.
-- **Persist adapter**: `apply = lib.unique` for dedup.
-
-The persist case could become a class collection strategy on `den.classes`. The niri case genuinely needs module-system-level customization. `den.provides.forward` stays for these cases.
-
-### 6.6 Dependency Chain
+### 6.6 Remaining Dependency Chain
 
 ```
-Provides removal (Section 5)
-  → Constraint handler simplification (Section 7.2)
-  → providerType dispatch (Section 7.3)
+Constraint handler simplification (Section 7.2) — independent
+providerType dispatch (Section 7.3) — independent
   → Aspect key type (Section 8)
-
-Forward auto-detection (6.2) — independent of provides removal
-  → Flat state field removal (6.4)
 ```
 
-### 6.7 Related Vestigial Items
+Forward items no longer block anything.
 
-- `__resolveCtx` / `__aspectPolicies` on forward specs — these were for sub-pipeline reconstruction. Verify they're no longer captured in `handlers/forward.nix`.
-- `resolveForwardSource` in pipeline.nix — check if still present. Should be eliminated with scope partition reads.
+### 6.7 Vestigial Items — ALL CLEAN
+
+- `__resolveCtx` / `__aspectPolicies`: absent from codebase
+- `resolveForwardSource`: absent from codebase
+- `applyForwardSpecs`: absent (logic inlined into `applyRoutes`; only a comment reference remains in `route.nix`)
 
 ---
 
@@ -428,14 +356,14 @@ Forward auto-detection (6.2) — independent of provides removal
 **Shipped:** `aspect.nix` decomposed into `class-module.nix`, `key-classification.nix`, `content-util.nix`, `include-emit.nix`, `wrap-classes.nix`. `transition.nix` deleted entirely.
 
 **Remains:**
-- Delete `emitSelfProvide` / `emitCrossProvideShims` from `aspect.nix` / `include-emit.nix` (blocked on provides removal, Section 5)
+- `emitSelfProvide` / `emitCrossProvideShims` / `provides-compat.nix` — all deleted (2026-05-04). Functionality folded into `emitAspectPolicies` in `include-emit.nix`. See Section 5 and `2026-05-04-provides-cleanup-design.md`.
 - `policy-dispatch.nix` at 656 lines is the largest file. Consider extraction of `classifyPolicyEffects` and enrichment iteration into focused helpers. Not urgent — the file is well-structured with clear function boundaries.
 
 ### 7.2 Constraint Handler Simplification
 
-After provides removal, the constraint registry simplifies:
+The constraint registry can be simplified (independent of provides, which remains):
 
-| Type | Current status | After provides removal |
+| Type | Current status | After cleanup |
 |------|---------------|----------------------|
 | `"exclude"` | Active — from `policy.exclude` | Unchanged |
 | `"substitute"` | Vestigial — from provides-era `meta.excludes` | Delete |
@@ -445,7 +373,7 @@ Delete `substituteChild` from `include-emit.nix`, `substitute` type from `constr
 
 ### 7.3 Architecture Cleanup Phase 3a: providerType Dispatch
 
-`types.nix:308` has a dead conditional — both branches call `contentType.merge`. The comment documents that the else-branch should dispatch to `providerType` for unregistered freeform keys after provides removal.
+`types.nix:308` has a dead conditional — both branches call `contentType.merge`. The comment documents that the else-branch should dispatch to `providerType` for unregistered freeform keys.
 
 **Design:** Two-branch dispatch in `aspectKeyType`:
 - Registered class keys → `contentType.merge` (ClassModule: provenance-wrapped `__contentValues`)
@@ -455,7 +383,7 @@ Delete `substituteChild` from `include-emit.nix`, `substitute` type from `constr
 
 **Risk:** Medium-high. `providerType` runs multi-def values through full aspect submodule merge (NixOS module system fixed-point) instead of list collection. This changes observable merge semantics for unregistered freeform keys defined from multiple files. Full CI gates the change.
 
-**Dependency:** Requires provides removal (the `provides` option must be gone for freeform keys to land at the correct level).
+**Dependency:** None — `provides` keys are handled by `structuralKeysSet` classification before reaching the freeform type dispatch. The `provides` option coexists with providerType dispatch.
 
 ---
 
@@ -469,7 +397,7 @@ The unified aspect key type replaces the current dual-type system (`aspectConten
 - `providerType` exists and is used for `includes` list elements and the `provides` submodule
 - Comment at line 288 documents the intended switch
 
-### 8.2 Two-Branch Design (Post-Provides-Removal)
+### 8.2 Two-Branch Design
 
 ```
 aspectKeyType.merge(loc, defs) =
@@ -493,7 +421,7 @@ The SemanticData branch uses the same merge as ClassModule (`__contentValues` pr
 
 ### 8.4 Execution
 
-Execution spec to be written after provides removal (Section 5) completes. The providerType dispatch (Section 7.3) is a prerequisite for the full aspect key type implementation.
+Execution spec to be written when ready. The providerType dispatch (Section 7.3) is a prerequisite for the full aspect key type implementation.
 
 ### 8.5 Registry Access
 
@@ -617,7 +545,7 @@ A filter policy gates includes within its activation scope. When an aspect is ab
 
 ### 9.6 Dependency
 
-This work depends on provides removal (Section 5) — the constraint registry simplification (Section 7.2, removing substitute type) should happen first, reducing the surface area that the policy scoping redesign needs to address.
+The constraint registry simplification (Section 7.2, removing substitute type) should happen first, reducing the surface area that the policy scoping redesign needs to address.
 
 ---
 

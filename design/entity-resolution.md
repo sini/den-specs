@@ -433,3 +433,35 @@ Any module can register new entity kinds by setting `den.schema.<name>`. If the 
 | `modules/policies/core.nix` | `host-to-users` policy |
 | `modules/policies/flake.nix` | Flake output policies and flake output class registration |
 | `nix/lib/policy-effects.nix` | Typed policy effect constructors |
+
+---
+
+## 8. Planned Redesign: Unified Resolve Effects
+
+**Spec:** `design/unified-resolve-effects.md`
+
+### Changes to Entity Resolution
+
+- **Section 4.3** (execution sequence): Steps 8-10 (walk tree, drain deferred, walk deferred results) change:
+  - `aspectToEffect entity` → `fx.send "resolve" { aspect = entity, identity, ctx }`
+  - `drain-deferred` → `fx.send "drain" { ctx = scopedCtx }` (same semantics, renamed)
+  - Deferred walk unchanged (re-resolves satisfiable items via `resolve` effect)
+
+- **Automatic drain:** For simple scope entries (enrichment widen in policy iteration), drain is automatic via `scope-widened` handler + `enterScope` wrapper. Entity resolution retains explicit drain at the precise point in its orchestration (after entity walk, before route propagation).
+
+- **Fan-out copy (copyDeferredToScope):** Unchanged. This is a state setup step (duplicating parent deferred into child scope), not a drain. Remains as direct state mutation in `resolve-schema-entity`.
+
+- **resolve-entity handler:** Unchanged. Still called by `resolve-schema-entity` to look up entity config.
+
+### New Primitive
+
+```nix
+enterScope = handlers: computation:
+  fx.effects.scope.provide handlers (
+    fx.bind (fx.send "scope-widened" { ctx = ctxFromHandlers handlers; }) (
+      _: computation
+    )
+  );
+```
+
+Used by `policy/iterate` for enrichment widen. NOT used by `resolve-schema-entity` (which needs precise drain timing).

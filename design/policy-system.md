@@ -383,3 +383,23 @@ A new `policy.filter` effect would replace the filter type in the constraint reg
 ### 9.5 Dependency
 
 This work depends on provides removal — the constraint registry simplification should happen first to reduce the surface area.
+
+---
+
+## 9. Planned Redesign: Unified Resolve Effects
+
+**Spec:** `design/unified-resolve-effects.md`
+
+### Changes to Policy Dispatch
+
+- **Enrichment drain:** `drainEnrichmentDeferred` (explicit function call inside iterate's scope.provide) is replaced by `enterScope` + automatic `scope-widened` handler. The iterate loop uses `enterScope` instead of raw `scope.provide` for enrichment widen — drain fires automatically at scope entry.
+
+- **installPolicies entry:** Unchanged externally. Internally, it calls the iterate loop which uses `enterScope`.
+
+- **Late dispatch pass:** Unchanged. Uses raw `scope.provide` (no drain needed — late dispatch only emits effects, doesn't create new deferrable aspects).
+
+### File Changes
+
+- `policy/iterate.nix`: `drainEnrichmentDeferred` deleted. `iterate`'s widen branch uses `enterScope` instead of `scope.provide + explicit drain`.
+- `policy/default.nix`: `installPolicies` unchanged (entry point semantics preserved).
+- `policy/schema.nix`: `lateDispatchPass` unchanged (no drain involved).

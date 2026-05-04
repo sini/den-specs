@@ -158,12 +158,12 @@ This ensures shared infrastructure (den.default aspect) is available in child sc
 
 ---
 
-## 6. Forward Auto-Detection (Planned, Not Implemented)
+## 6. Forward Auto-Detection (Implemented)
 
-The `forwardHandler` in `handlers/forward.nix` already classifies forwards into route-eligible vs complex:
+The `forwardHandler` in `handlers/forward.nix` classifies forwards into route-eligible (Tier 1) vs complex (Tier 2) at handler time:
 
 ```nix
-isRouteEligible = isSimpleSpec && sourceIsLocal && sourceAlreadyCollected;
+isTier1 = isSimpleSpec && sourceIsLocal && sourceAlreadyCollected;
 ```
 
 Where:
@@ -171,9 +171,13 @@ Where:
 - `sourceIsLocal`: no `__scopeHandlers` on source aspect (same entity)
 - `sourceAlreadyCollected`: source class exists in current scope's `scopedClassImports`
 
-When all three conditions hold, the forward is stored as a simple route shape (no `__complexForward` marker). This automatic classification means users writing simple `den.provides.forward` entries get route performance without migration.
+When all three conditions hold, the forward is stored as a simple route shape (no `__complexForward` marker). Otherwise, the full forward spec is stored with `__complexForward = true`. Both tiers go into `scopedRoutes` and are handled uniformly by `applyRoutes` in `route.nix`.
 
-The **planned but unimplemented** extension: allowing users to write `den.provides.forward` with simple specs and having the system transparently convert them to `policy.route` effects at the policy level. Currently this happens at the handler level (post-emit), not at the API level.
+This automatic classification means users writing simple `den.provides.forward` entries get route performance without migration.
+
+**Related completions:**
+- **Scope-prefixed dedup keys:** Both `includeSeen` (`check-dedup.nix`) and `ctxSeen` (`ctx.nix`) are scope-prefixed, ensuring correct dedup across scopes.
+- **Flat state field removal:** `scopedClassImports` is the sole source of truth during the walk. No flat `classImports` state field exists. Post-pipeline flattening is a local variable in `fxResolve`, not a state field.
 
 ---
 
@@ -186,9 +190,9 @@ On feat/fx-pipeline, the legacy `provides.os-class`, `provides.os-user`, and `pr
 | `os-class.nix` (os -> nixos/darwin) | Auto-detected as route-eligible: forward with `fromClass = "os"`, `intoClass = host.class`, `path = []` classifies as simple route |
 | `os-user.nix` (user -> OS class) | Part of `makeHomeEnv` complex forward: uses `forwardPathFn`, `resolveEntity`, adapter machinery |
 | `wsl.nix` (wsl -> OS) | Forward with guard, path nesting: classifies as complex route with `guardFn` |
-| `provides.to-hosts` / `provides.to-users` | `provides-compat.nix` shim: translates to `policy.include` effects via aspect policies |
+| `provides.to-hosts` / `provides.to-users` | Built-in: `emitAspectPolicies` translates to `policy.include` effects during aspect walk |
 
-The `provides-compat.nix` shim handles legacy `den.aspects.X.provides.to-hosts` and `den.aspects.X.provides.to-users` patterns by registering aspect policies that emit `policy.include` during dispatch. These are deprecated with warnings.
+Cross-entity routing (`provides.to-users`, `provides.to-hosts`, `provides.<name>`) is built into `emitAspectPolicies` in `include-emit.nix`. The old `provides-compat.nix` shim was deleted and its functionality folded in as a first-class pipeline feature. No deprecation — provides is a permanent API.
 
 ---
 
@@ -246,6 +250,6 @@ The critical ordering invariant: **provides before routes**. Complex forward-der
 | `nix/lib/forward.nix` | `forwardItem`, `forwardEach` (user-facing API) |
 | `nix/lib/policy-effects.nix` | `policy.route`, `policy.provide` constructors |
 | `nix/lib/aspects/fx/policy-dispatch.nix` | Policy dispatch, effect classification, `policyEmitEffects` |
-| `nix/lib/aspects/fx/handlers/provides-compat.nix` | Legacy provides.to-hosts/to-users shim |
+| `nix/lib/aspects/fx/include-emit.nix` | `emitAspectPolicies` — handles provides cross-entity routing (replaced provides-compat.nix) |
 | `nix/lib/home-env.nix` | `makeHomeEnv` (complex forward example) |
 | `nix/lib/aspects/fx/wrap-classes.nix` | `wrapCollectedClasses` (post-pipeline module wrapping) |

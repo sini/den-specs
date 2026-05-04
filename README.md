@@ -6,7 +6,7 @@ Design specs for [den](https://github.com/denful/den), a NixOS configuration fra
 
 Den's `feat/fx-pipeline` branch replaced the legacy aspect resolution pipeline with an algebraic effects architecture. The initial implementation introduced scope-partitioned state, typed policy effects, and entity-schema-driven resolution — but accumulated tech debt as each new mechanism (transitions, DLQ, traits, forward sub-pipelines) interacted with every other. A cleanup arc deleted ~3000 lines by recognizing that `scope.provide` — the effect system's own scoping primitive — could replace most of the manually-built machinery. Transitions became `installPolicies` with lexical `scope.provide`, the DLQ was eliminated in favor of direct class emission, and the trait system was removed for a simpler reimplementation.
 
-The result is a pipeline where policy dispatch, context expansion, and entity resolution are composed from small effect handlers rather than orchestrated by monolithic dispatchers. Scope partitioning gives each entity its own state partition without sub-pipeline isolation. Routes and provides deliver content post-pipeline from those partitions. The remaining work — provides removal, pipeline-time trait reimplementation + fleet/den.exports for cross-host data, and policy scoping — builds on this foundation without requiring further architectural changes.
+The result is a pipeline where policy dispatch, context expansion, and entity resolution are composed from small effect handlers rather than orchestrated by monolithic dispatchers. Scope partitioning gives each entity its own state partition without sub-pipeline isolation. Routes and provides deliver content post-pipeline from those partitions. The `provides.*` API remains as a first-class user-facing interface, now powered internally by policy effects. The remaining work — forward elimination, aspect key type unification, pipeline-time trait reimplementation + fleet/den.exports for cross-host data, and policy scoping — builds on this foundation without requiring further architectural changes.
 
 ## Design Specs (Current Architecture)
 
@@ -39,6 +39,12 @@ These describe the pipeline as it exists today (629/629 tests, PR [#475](https:/
 | Component | Spec | Summary |
 |-----------|------|---------|
 | **Diagram System** | [design/diagram-system.md](design/diagram-system.md) | `tracingHandler` captures pipeline events into structured traces. 31-file diag library constructs format-agnostic graph IR with nodes, edges, and entity kind metadata. 20+ renderers (Mermaid, C4, Graphviz, PlantUML, JSON). Views system with core, extended, fleet, and DAG perspectives. |
+
+### Cleanup (Designed, Not Yet Implemented)
+
+| Component | Spec | Summary |
+|-----------|------|---------|
+| **Provides Cleanup** | [design/provides-cleanup.md](design/provides-cleanup.md) | `provides`/`_` stays as permanent user API (virtual sub-aspect namespace). `provides-compat.nix` deleted; functionality folded into `emitAspectPolicies`. Self-provide and cross-entity routing handled in one pipeline phase. `resolveChildren` simplifies from 5 phases to 3. New users use policies + direct nesting; existing patterns unchanged. |
 
 ### Planned (Not Yet Implemented)
 
