@@ -52,7 +52,7 @@ These describe the pipeline as it exists today (629/629 tests, PR [#475](https:/
 | Document | Purpose |
 |----------|---------|
 | [IMPLEMENTATION-NARRATIVE.md](IMPLEMENTATION-NARRATIVE.md) | Phase-by-phase arc from midpoint to current state. What was designed, what shipped, where it diverged, what survived vs was reversed. |
-| [Consolidated Spec](https://gist.github.com/sini/bdc1f509f87f0ae4869e84f6a310d04b) | Authoritative reference for current pipeline state, design invariants, remaining work, vestigial code audit. Also at `docs/superpowers/specs/2026-05-02-fx-pipeline-consolidated.md` in the den repo. |
+| [Consolidated Spec](2026-05-02-fx-pipeline-consolidated.md) | Authoritative reference for current pipeline state, design invariants, remaining work, vestigial code audit. [Gist mirror](https://gist.github.com/sini/bdc1f509f87f0ae4869e84f6a310d04b). |
 | [SUMMARY.md](SUMMARY.md) | Legacy audit of all 51 original specs with verdicts. Partially stale — design specs above are the current source of truth. |
 
 ## Archive

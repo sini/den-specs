@@ -1,7 +1,7 @@
 # Implementation Narrative: feat/fx-pipeline Branch
 
 **Date:** 2026-05-04
-**Purpose:** Accurate intermediate documentation tracing how the fx-pipeline implementation evolved. Designed to be consumed alongside the consolidated spec (`docs/superpowers/specs/2026-05-02-fx-pipeline-consolidated.md`) for producing accurate end-state documentation.
+**Purpose:** Accurate intermediate documentation tracing how the fx-pipeline implementation evolved. Designed to be consumed alongside the consolidated spec (`2026-05-02-fx-pipeline-consolidated.md`) for producing accurate end-state documentation.
 
 **Reading guide:** This document covers the implemented-branch specs chronologically. For each phase, it describes what was designed, what actually shipped, where the design diverged, and what the lasting consequence is. The consolidated spec describes the current end-state; this document explains how we got there and why.
 
