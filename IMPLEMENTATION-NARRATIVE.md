@@ -150,11 +150,48 @@ Minimal. `ctxFromHandlers` replaced `aspect.__ctx or {}` — already reflected i
 
 **Stages elimination** is permanent — the three-layer model (aspects, policies, schema includes) is the foundation. **Direct-ref aspects** is permanent. **Class emission dedup** mechanisms (`includeSeen`, unsatisfied guard) survived intact.
 
-**Traits** are the major reversal. The entire three-tier model was built, shipped, tested, then deleted. The consolidated spec Section 11 preserves the fleet + den.exports design for reimplementation. Key insight preserved: pipeline-time trait flags (booleans/enums for routing) are separate from NixOS-config-dependent data (fleet + den.exports handles that).
+**Traits** were tactically removed — not design-rejected. The entire three-tier model was built, shipped, tested, and validated. It was deleted because it was interleaved with mechanisms being redesigned (transitions, DLQ, dispatch) — not because the API or design was wrong. The consolidated spec Section 11 describes the reimplementation path. Key architectural evolution: the original spec's cross-entity trait routing via provide-to is replaced by scope inheritance + fleet/den.exports, which is a better foundation. The core trait design (schema-driven classification, three-tier eval, collection strategies, pipeline-time consumption via `{ traitName, ... }:` discriminators) remains the target API.
 
-### Staleness in these specs
+### Status of traits design against current architecture
 
-- **All traits specs** describe a deleted system. The design insights are valuable but the implementation details are entirely gone.
+The traits spec (`2026-04-25-traits-and-structural-nesting-design.md`) describes the target API for reimplementation. Here's how each section maps to the post-cleanup architecture:
+
+| Spec section | Status | Notes |
+|---|---|---|
+| Schema registry (`den.classes`, `den.traits`) | **Ready to reimplement.** `den.classes` already exists. `den.traits` option was removed with traits but the pattern is established. |
+| Aspect content type (`aspectContentType`) | **Already reimplemented differently.** Current `aspectKeyType` (types.nix:293) is the placeholder with dead two-branch dispatch. The spec's wrapper approach (generic `__contentValues` + pipeline classifies) is what shipped and survives. |
+| Structural detection (classifyKeys) | **Partially live.** `key-classification.nix` does class registry dispatch. Adding trait registry dispatch is the two→three branch upgrade (consolidated spec Section 8.3). |
+| Trait collection (traitCollectorHandler, emit-trait) | **Needs reimplementation.** The handler and effect were deleted. Reinstating them is straightforward — the handler pattern is ~30 lines. The scope-partitioned state means trait data would be `scopedTraits.${scopeId}` (scoped, like classImports). |
+| Trait consumption (traitArgHandler, `_den.traits`) | **Needs reimplementation.** Pipeline-time consumption via `{ traitName, ... }:` discriminators works via the same `bind.fn` mechanism used for entity context. Module-time consumption via `_den.traits` injection module is straightforward. |
+| Tier detection (1/2/3) | **Unchanged.** Same `builtins.functionArgs` + module-system arg detection. `wrapClassModule` already handles the mixed-arg pre-application. |
+| Nested aspects (provides → direct nesting) | **Blocked on provides removal.** The current `provides` structural key must be removed first (consolidated spec Section 5). The `aspectKeyType` providerType dispatch (Section 7.3) then enables direct nesting. |
+| Cross-entity trait distribution (provide-to) | **Superseded.** The original spec's provide-to mechanism (two-phase: sub-pipeline captures traits → distribute to targets) is replaced by: (a) scope inheritance for same-pipeline cross-scope data, (b) fleet + `den.exports` for cross-host NixOS-config-dependent data. The fleet pattern is superior for the haproxy/etc-hosts cases because it uses Nix's lazy evaluation directly rather than a custom distribution phase. |
+| Dynamic trait schema registration | **Design validated, needs reinstatement.** The scope-partitioned spec's `register-trait-schema` effect was implemented then deleted with traits. The design (dynamic registration during tree-walk, DLQ-free since unregistered keys emit as classes) is validated. Reinstatement: add `state.traitSchemas` (global), `register-trait-schema` handler, `classifyKeys` reads from dynamic registry. |
+| `partialOk` validation | **Needs reimplementation.** The mismatch check (pipeline-time consumer + Tier 3 emitter = error unless `partialOk`) is a post-pipeline validation that needs `state.consumedTraits` tracking. |
+| Namespace integration (`den.ful.*.traits`) | **Ready.** Namespace type system already supports arbitrary sub-options. Adding `traits` follows the `aspects`/`schema` pattern. |
+| Forward battery integration (`forwardTo` on class schema) | **Partially superseded.** `policy.route` handles the common case. `forwardTo` on class schema could still simplify the remaining Tier 2 forwards. |
+
+### What the cleanup arc improved for traits reimplementation
+
+The traits design will be **simpler** to reimplement on the current architecture because:
+
+1. **No DLQ interaction.** The original implementation used DLQ for unregistered keys that later got classified as traits. With DLQ eliminated, unregistered keys emit as classes immediately. Trait schema registration either happens before key classification (via `den.traits` module-eval-time registration) or via dynamic `register-trait-schema` during tree walk (which doesn't need DLQ — it just changes classifyKeys behavior for future encounters).
+
+2. **No provide-to interaction.** Cross-entity traits used the provide-to mechanism (sub-pipeline capture → distribution phase). With scope inheritance, cross-scope trait data flows naturally via `scopeParent` tree walking. The fleet + den.exports pattern handles the NixOS-config-dependent case without pipeline involvement.
+
+3. **No transition interaction.** The original trait inheritance walked `scopeParent` chains that were populated by transition sub-pipelines. With `installPolicies` using `scope.provide`, scope creation is structural — `resolve-schema-entity` creates scopes, and traits emitted within those scopes are naturally partitioned.
+
+4. **Narrower handler interface.** The original `traitCollectorHandler` captured root `ctx` at construction time (causing a Tier 2 misclassification bug). On the current architecture, `scopeContexts.${currentScope}` provides per-scope context — no stale capture.
+
+5. **`installPolicies` handles trait-arg-satisfied policies naturally.** The enrichment iteration already re-dispatches when context widens. Adding trait names to the context set (so `{ firewall, ... }:` policies fire when firewall trait data exists) is a natural extension of the existing `resolveArgsSatisfied` mechanism.
+
+### Staleness in traits specs (code-level only, not design-level)
+
+- Handler file locations — `handlers/trait.nix` deleted, would be recreated
+- State field names — `scopedTraits`, `scopedDeferredTraits`, `scopedConsumedTraits`, `traitSchemas` would be recreated with same or similar names
+- DLQ references — DLQ eliminated, trait classification uses different mechanism
+- `emitTraitSchemas` ordering in `resolveChildren` — the function was in aspect.nix, would be reinstated
+- `provide-to` / `distribute-cross-entity` references — deleted, replaced by scope inheritance + fleet
 - `entityIncludes` references in stages specs — deleted twice (introduced then removed).
 - `rootIncludes` — deleted.
 - `provide-to` unification — deleted with provide-to.
