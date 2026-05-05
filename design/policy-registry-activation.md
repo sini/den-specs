@@ -346,7 +346,7 @@ Policies that DON'T produce resolve effects (only include, route, provide, exclu
 
 ## 9. Interaction with Enrichment Loop
 
-### 8.1 No New Machinery Needed
+### 9.1 No New Machinery Needed
 
 The existing iterate loop handles policies-as-includable-values without structural changes. The phase sequence per aspect in `resolve-children.nix` is:
 
@@ -358,7 +358,7 @@ The existing iterate loop handles policies-as-includable-values without structur
 6. Next iteration dispatches newly registered policies
 7. Repeat until stable (bounded by `maxPolicyIterations = 10`)
 
-### 8.2 Cascading Enrichment
+### 9.2 Cascading Enrichment
 
 Chained enrichment across drain boundaries works naturally:
 
@@ -386,9 +386,9 @@ Round 3: drain → `firewall-rules` resolves → `open-port` registers → fires
 
 Each `go` iteration in `iterate.nix` does: dispatch → widen → enterScope (drain → resolve → register) → next iteration catches new policies.
 
-## 9. Concrete API Translation
+## 10. Concrete API Translation
 
-### 9.1 Core Traversal Policy
+### 10.1 Core Traversal Policy
 
 ```nix
 # Before:
@@ -402,7 +402,7 @@ den.policies.host-to-users = { host, ... }:
 den.schema.host.includes = [ den.policies.host-to-users ];
 ```
 
-### 9.2 Flake Output Policies
+### 10.2 Flake Output Policies
 
 ```nix
 # Before:
@@ -418,7 +418,7 @@ den.schema.flake.includes = [ den.policies.to-systems ];
 
 Same pattern for `to-os-outputs`, `to-hm-outputs`, `to-${output}`.
 
-### 9.3 Aspect-Included Policies
+### 10.3 Aspect-Included Policies
 
 ```nix
 # Before (auto-activated, manual guard):
@@ -439,7 +439,7 @@ den.aspects.igloo.includes = [
 
 The policy body no longer carries the guard — `policy.for` handles entity targeting at the activation site. The policy itself is generic and reusable.
 
-### 9.4 Predicate-Guarded Policies
+### 10.4 Predicate-Guarded Policies
 
 ```nix
 # Before (manual guard in policy body):
@@ -465,7 +465,7 @@ den.schema.user.includes = [
 ];
 ```
 
-### 9.5 Global Policies
+### 10.5 Global Policies
 
 ```nix
 # Before (auto-activated):
@@ -479,9 +479,9 @@ den.policies.os-to-host = { host, ... }:
 den.default.includes = [ den.policies.os-to-host ];
 ```
 
-## 10. Changes to Module System
+## 11. Changes to Module System
 
-### 10.1 New `policyType`
+### 11.1 New `policyType`
 
 A new option type for `den.policies.*` that wraps function values with identity metadata:
 
@@ -495,11 +495,11 @@ policyType = lib.types.lazyAttrsOf (lib.types.mkOptionType {
 
 The type introspects `lib.functionArgs` from the wrapped function to support dispatch matching.
 
-### 10.2 Remove `den.schema.*.policies`
+### 11.2 Remove `den.schema.*.policies`
 
 The `policies` field is removed from the schema merge logic in `modules/options.nix`. Schema entries retain `includes` (which now carries both aspects and policies).
 
-### 10.3 Aspect `policies.*` Becomes Registry-Only
+### 11.3 Aspect `policies.*` Becomes Registry-Only
 
 The unconditional `register-aspect-policy` loop in `emitAspectPolicies` (`aspect/provide.nix` lines 136-144) is **deleted**. This loop currently auto-registers all `aspect.policies.*` entries — removing it is the core behavioral change that decouples declaration from activation.
 
@@ -509,9 +509,9 @@ After deletion, `emitAspectPolicies` retains only:
 
 The `aspect.policies.*` namespace remains as a sub-registry — a place to define policies owned by the aspect. Activation requires explicit inclusion via `aspect.includes`.
 
-## 11. Pipeline Changes
+## 12. Pipeline Changes
 
-### 11.1 Include Handler
+### 12.1 Include Handler
 
 The `__isPolicy` check is added to `processInclude` in `aspect/children.nix` (the function that processes individual include entries before dispatching them). This is where parametric aspects are already detected and deferred — the policy check fits naturally:
 
@@ -530,7 +530,7 @@ processInclude = child:
 
 Note: `resolve-children.nix` orchestrates the phase sequence (`emitAspectPolicies` → `emitIncludes` → `installPolicies`) but does not inspect individual include entries. The `__isPolicy` check lives in the include processing path, not the orchestrator.
 
-### 11.2 Constraint Checking for Policies
+### 12.2 Constraint Checking for Policies
 
 Before dispatch, `dispatchDirect` and `dispatchAspect` check constraints:
 
@@ -540,14 +540,14 @@ for each registered policy:
   else if resolveArgsSatisfied policy.fn ctx then fire
 ```
 
-### 11.3 State Changes
+### 12.3 State Changes
 
 - Remove `den.schema.*.policies` from pipeline state construction
 - `state.scopedAspectPolicies` unchanged — still keyed by scope, populated by `register-aspect-policy`
 - `state.dispatchedPolicies` unchanged
 - `state.firedPolicyNames` unchanged
 
-### 11.4 `installPolicies` Source Change
+### 12.4 `installPolicies` Source Change
 
 Currently reads from three sources (`policy/default.nix` lines 95-97):
 
@@ -565,7 +565,7 @@ After: **delete all three lines.** All policy dispatch goes through `state.flatA
 
 `dispatchDirect` is also updated: since all policies are now `{ __isPolicy; name; fn; }` records (not raw functions), it calls `policy.fn resolveCtx` and checks `resolveArgsSatisfied policy.fn resolveCtx` rather than calling the policy directly.
 
-## 12. `policy.resolve` is One Operation
+## 13. `policy.resolve` is One Operation
 
 `policy.resolve` adds bindings to context. Whether the pipeline treats those bindings as entity creation (scope partition) or context enrichment (widening) is determined by schema classification — not by the user. This is the correct abstraction:
 
@@ -576,15 +576,15 @@ After: **delete all three lines.** All policy dispatch goes through `state.flatA
 
 No change needed to `policy.resolve`. The variant explosion (7 call signatures from `shared × targetKind × withIncludes`) is a separate usability concern addressed below.
 
-### 12.1 Resolve Variant Cleanup
+### 13.1 Resolve Variant Cleanup
 
 The 7 variants (`resolve`, `resolve.shared`, `resolve.to`, `resolve.shared.to`, `resolve.withIncludes`, `resolve.to.withIncludes`, `resolve.shared.withIncludes`) are a combinatorial product. Consider collapsing to fewer entry points — e.g., a single `resolve.with { shared = true; targetKind = "foo"; includes = [...]; } bindings` alongside the simple `resolve bindings` form. This is independent of the registry/activation split and can be addressed as a follow-up API cleanup.
 
-## 13. Error Diagnostics
+## 14. Error Diagnostics
 
 Fold these improvements into the implementation:
 
-### 13.1 Effect Validation
+### 14.1 Effect Validation
 
 Validate policy return values at the call site. Currently, malformed effects (non-attrsets, missing `__policyEffect`, wrong shape) are silently dropped in `classify.nix`. After: validate immediately after calling `policy.fn ctx` and throw with the policy name:
 
@@ -592,7 +592,7 @@ Validate policy return values at the call site. Currently, malformed effects (no
 "den: policy '${name}' returned invalid effect at index ${i}: expected attrset with __policyEffect, got ${typeOf eff}"
 ```
 
-### 13.2 Cycle Diagnostics
+### 14.2 Cycle Diagnostics
 
 The enrichment cycle error (`iterate.nix` line 71) names only the entity kind. Include the fired policy names and current enrichment keys:
 
@@ -600,11 +600,11 @@ The enrichment cycle error (`iterate.nix` line 71) names only the entity kind. I
 "den: enrichment cycle at ${entityKind} — fired: ${concatStringsSep ", " (attrNames firedPolicies)}, enrichment keys: ${concatStringsSep ", " (attrNames accEnrichment)}"
 ```
 
-## 14. `pipelineOnly` Placement
+## 15. `pipelineOnly` Placement
 
 `policy.pipelineOnly` is an internal collision-policy mechanism used only by `den.provides.flake-scope`. Move it out of the public `den.lib.policy.*` namespace into an internal namespace (e.g., `den.lib._internal.pipelineOnly` or inline it into `flake-scope.nix`).
 
-## 15. Provides-Cleanup Interaction
+## 16. Provides-Cleanup Interaction
 
 Both this spec and `design/provides-cleanup.md` modify `emitAspectPolicies` in `aspect/provide.nix`:
 - **This spec** removes the `policies.*` auto-registration loop (lines 136-144)
@@ -614,11 +614,11 @@ These are **not conflicting**: provides-derived policies (from `provides.to-host
 
 Implementers should be aware: "stop auto-registering `policies.*`" means deleting the loop over `builtins.attrNames (aspect.policies or {})`, NOT the provides-derived registration that produces `register-aspect-policy` for cross-entity keys.
 
-## 16. Traits/Exports Integration
+## 17. Traits/Exports Integration
 
 The future traits system and `den.exports` pattern (fleet) provide explicit upward data flow. Policies that need upward resolution (e.g., "export this host's firewall ports for the load balancer") would use `policy.export` or similar — not policy includes. This is out of scope for this spec but the scoping model is designed to accommodate it: downward cascade for policies, explicit exports for upward flow.
 
-## 17. Files to Change
+## 18. Files to Change
 
 ### Delete
 - `den.schema.*.policies` merge logic from `modules/options.nix`
