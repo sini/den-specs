@@ -319,7 +319,32 @@ Identity is derived from the registry path, same as aspect identity is derived f
 - **Tracing**: policy identity appears in trace output for debugging
 - **Override**: a policy with the same identity at a deeper scope shadows the parent (future consideration)
 
-## 8. Interaction with Enrichment Loop
+## 8. Invariant: Policies Don't Apply to Their Own Outputs
+
+When policy P produces a resolve effect that creates child entity E, **P is excluded from dispatch at E's scope.** A policy's output is not its input.
+
+This prevents self-referential cycles: a policy that transforms its context bindings (`v = "${v}!"`) would otherwise fire at its own child entity with the mutated bindings, creating unbounded recursion with unique contexts that `ctx-seen` cannot deduplicate.
+
+### 8.1 Implementation
+
+The source policy name is threaded through the resolve chain:
+
+1. `classifyPolicyResult` preserves `policyName` on classified results
+2. `collectSchemaEffects` tags each schema effect with `__sourcePolicyName = policyName`
+3. `processSingleResolve` passes `sourcePolicyName` to `resolve-schema-entity`
+4. `resolve-schema-entity` passes it to `push-scope`
+5. `push-scope` stores `state.scopeSourcePolicy.${newScopeId} = sourcePolicyName`
+6. `installPolicies` reads `scopeSourcePolicy` for the current scope and seeds `firedPolicies` with it, so `dispatchAspect` skips the policy
+
+### 8.2 Scope
+
+This invariant applies per-resolve-effect. If policy P produces multiple resolve effects (e.g., `host-to-users` creates multiple users), P is excluded from each child scope. Other policies are unaffected — they fire normally at child entities.
+
+Policies that DON'T produce resolve effects (only include, route, provide, exclude, or enrichment) are unaffected by this mechanism.
+
+---
+
+## 9. Interaction with Enrichment Loop
 
 ### 8.1 No New Machinery Needed
 
