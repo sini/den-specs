@@ -1,6 +1,6 @@
 # Constraint System
 
-**Branch:** feat/fx-pipeline (629/629 tests)
+**Branch:** feat/fx-pipeline (713/713 tests)
 **Date:** 2026-05-04
 **Scope:** How den gates aspect inclusion via constraints: excludes, filters, substitutions
 

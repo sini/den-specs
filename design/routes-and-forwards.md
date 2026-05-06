@@ -1,4 +1,4 @@
-# Routes and Forwards: Design Spec (feat/fx-pipeline, 629/629 tests)
+# Routes and Forwards: Design Spec (feat/fx-pipeline, 713/713 tests)
 
 Status: Documents the **implemented** route and forward infrastructure as of 2026-05-04.
 

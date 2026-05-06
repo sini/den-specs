@@ -2,9 +2,8 @@
 
 **Date:** 2026-05-04
 **Branch:** feat/fx-pipeline
-**Status:** Design approved, implementation pending
-**CI:** 629/629
-**Prerequisite:** None — independent of all other remaining work items
+**Status:** Implemented (713/713 tests)
+**Date completed:** 2026-05-05
 
 ## 1. Context
 
@@ -163,7 +162,7 @@ The `"compat:"` prefix on policy names (e.g., `"igloo/compat:to-users"`) changes
 
 ### Verification
 
-Full CI (629/629) must pass after the change. The two test failures noted in the old provides-removal spec (`deadbugs-cybolic-routes.test-has-no-dups`, `user-host-mutual-config.test-host-parametric-unidirectional`) may be affected — investigate if they were caused by provides-compat interaction bugs.
+Full CI (713/713) must pass after the change. The two test failures noted in the old provides-removal spec (`deadbugs-cybolic-routes.test-has-no-dups`, `user-host-mutual-config.test-host-parametric-unidirectional`) may be affected — investigate if they were caused by provides-compat interaction bugs.
 
 ## 7. Real-World Compatibility
 

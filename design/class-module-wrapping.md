@@ -1,7 +1,7 @@
 # Class Module Wrapping and Collision Policies
 
-**Branch:** `feat/fx-pipeline` (629/629 tests passing)
-**Date:** 2026-05-04
+**Branch:** `feat/fx-pipeline` (713/713 tests passing)
+**Date:** 2026-05-04 (updated 2026-05-05)
 **Status:** Implemented
 
 ## 1. The Problem
@@ -92,8 +92,11 @@ The validator is emitted as a separate module (not merged into the wrapper) so t
 | Level | Source | Scope |
 |-------|--------|-------|
 | Aspect | `aspect.meta.collisionPolicy` | All class modules in that aspect (single enum, not per-field) |
-| Entity | `ctx.${name}.collisionPolicy` | The specific entity value declares its own policy via schema |
+| Entity (instance) | `ctx.${name}.collisionPolicy` | Per-entity instance (e.g., `pipelineOnly` tagged values) |
+| Entity (schema) | `ctx.__collisionPolicies.${name}` | Schema-level policy from `den.schema.<kind>.collisionPolicy` |
 | Global | `den.config.classModuleCollisionPolicy` | Entire flake, default `"error"` |
+
+**Implementation note:** The schema-level policy is captured eagerly in `resolveEntity` (from `den.schema.<kind>.collisionPolicy`) and stored in `ctx.__collisionPolicies` rather than read from the live entity config. This avoids circular evaluation: `wrapClassModule` runs post-pipeline, and accessing the live schema config would cycle through `den.schema.<kind>.resolved` → pipeline → `wrapClassModule`.
 
 ### Policy values
 
@@ -159,7 +162,7 @@ For each entry in the class imports:
 1. **Skip non-raw entries:** Legacy or already-wrapped entries pass through unchanged.
 2. **Merge enrichment:** `mergeEnrichment` adds scope-context keys that aren't already in the entry's emit-time ctx. This preserves entity bindings from the original scope while adding enrichment args.
 3. **Wrap:** Calls `wrapClassModule` with the enriched ctx.
-4. **Strip enrichment args:** `stripEnrichmentArgs` removes enrichment-only keys from the module's advertised `functionArgs`. Without this, NixOS would probe `_module.args` for keys that don't exist and crash.
+4. **Strip enrichment args:** `stripEnrichmentArgs` removes enrichment-only keys from the module's advertised `functionArgs`. Without this, NixOS would probe `_module.args` for keys that don't exist and crash. Keys listed in the wrapper's `advertisedArgs` (den args intentionally advertised for collision detection) are preserved — stripping them would prevent NixOS from passing `_module.args` values needed for `class-wins` policy.
 5. **Compute identity:** `computeModuleIdentity` determines whether the module is anonymous and computes a final identity. Context-dependent modules keep the full identity (with ctxId); non-context-dependent modules strip the ctxId suffix.
 6. **Wrap for module system:** `wrapModule` applies location and key-based dedup:
    - Anonymous modules: `lib.setDefaultModuleLocation` (location only, no key dedup)
@@ -169,7 +172,7 @@ For each entry in the class imports:
 
 ## 6. emit-class handler
 
-**File:** `nix/lib/aspects/fx/handlers/tree.nix`, `classCollectorHandler`
+**File:** `nix/lib/aspects/fx/handlers/class-collector.nix`
 
 The `emit-class` handler runs during pipeline evaluation (Phase 1) and collects class modules into scope-partitioned state.
 

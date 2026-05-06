@@ -1,9 +1,9 @@
 # Policy Registry/Activation Split — Design Spec
 
 **Date:** 2026-05-05
-**Branch:** feat/fx-pipeline (not yet on main)
-**Status:** Design draft
-**Prerequisite:** None — this is a hard API break, not a migration
+**Branch:** feat/fx-pipeline
+**Status:** Implemented (713/713 tests)
+**Date completed:** 2026-05-05
 
 ---
 

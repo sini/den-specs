@@ -1,14 +1,17 @@
 # Unified Resolution with Effect-Driven Bind
 
-## Problem
+**Status:** Implemented (feat/fx-pipeline, 713/713 tests)
+**Date completed:** 2026-05-05
 
-The current fx-pipeline has inconsistent abstraction levels:
-- Some operations are effects (check-dedup, check-constraint, emit-class)
-- Others are direct function calls (classifyKeys, emitClasses, resolveChildren)
-- Parametric and static resolution are separate effects despite converging to the same path
-- Deferral is a separate mechanism from binding, despite being "bind that can't resolve yet"
-- Drain is explicit at two call sites rather than reactive to scope changes
-- Large handlers contain multiple branches mixing "what kind of thing is this?" with "how to process it"
+## Problem (historical)
+
+The fx-pipeline had inconsistent abstraction levels:
+- Some operations were effects (check-dedup, check-constraint, emit-class)
+- Others were direct function calls (classifyKeys, emitClasses, resolveChildren)
+- Parametric and static resolution were separate effects despite converging to the same path
+- Deferral was a separate mechanism from binding, despite being "bind that can't resolve yet"
+- Drain was explicit at two call sites rather than reactive to scope changes
+- Large handlers contained multiple branches mixing "what kind of thing is this?" with "how to process it"
 
 ## Design Principles
 

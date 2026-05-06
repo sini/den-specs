@@ -1,8 +1,11 @@
 # Policy Iteration and Entity Resolution as Primitive Compositions
 
-## Problem
+**Status:** Implemented (feat/fx-pipeline, 713/713 tests)
+**Date completed:** 2026-05-05
 
-The policy iteration loop (`policy/iterate.nix`) and entity resolution handler (`resolve-schema-entity.nix`) contain multi-step orchestration with inline state mutations. While the iterate loop benefits from staying as a recursive function, its internal steps (dispatch, record fired, emit effects, widen context) are opaque to tracing. Entity resolution's scope management combines multiple concerns into one handler body.
+## Problem (historical)
+
+The policy iteration loop (`policy/iterate.nix`) and entity resolution handler (`resolve-schema-entity.nix`) contained multi-step orchestration with inline state mutations. The iterate loop's internal steps (dispatch, record fired, emit effects, widen context) were opaque to tracing. Entity resolution's scope management combined multiple concerns into one handler body.
 
 ## Design Principles
 

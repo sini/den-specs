@@ -1,7 +1,7 @@
 # Entity Resolution and Schema System
 
 **Date:** 2026-05-04
-**Branch:** feat/fx-pipeline (629/629 tests)
+**Branch:** feat/fx-pipeline (713/713 tests)
 **Scope:** How den defines entity kinds, registers classes, resolves entities through the pipeline, and structures the three-layer model.
 
 This document describes the current implementation, not aspirational design.

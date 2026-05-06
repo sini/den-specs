@@ -1,7 +1,7 @@
 # Aspect Compilation and Include Resolution
 
 **Date:** 2026-05-04
-**Branch:** feat/fx-pipeline (629/629 tests)
+**Branch:** feat/fx-pipeline (713/713 tests)
 **Scope:** How aspect attrsets become effect computations, how includes are resolved, and the narrow effect vocabulary that drives the pipeline.
 
 ---

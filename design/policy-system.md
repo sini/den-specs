@@ -1,4 +1,4 @@
-# Den Policy System — Design Spec (feat/fx-pipeline, 629/629)
+# Den Policy System — Design Spec (feat/fx-pipeline, 713/713)
 
 **Date:** 2026-05-04
 **Branch:** feat/fx-pipeline
