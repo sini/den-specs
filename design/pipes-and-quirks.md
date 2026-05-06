@@ -130,9 +130,9 @@ Policies control data flow between scopes:
 den.policies.dc-backends =
   let inherit (den.lib.policy) pipe; in
   { host, ... }:
-  let sourceHost = host; in [
+  let receiver = host; in [
     (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: host.datacenter == sourceHost.datacenter))
+      (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
     ])
   ];
 
@@ -256,7 +256,7 @@ Transform stages apply in declared order. Routing stages are terminal — at mos
 
 ```nix
 (pipe.from den.pipes.http-backends [
-  (pipe.collect ({ host, ... }: host.datacenter == sourceHost.datacenter))
+  (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
   (pipe.filter (b: b.port != 8080))
   (pipe.to [ den.aspects.haproxy ])
 ])
@@ -270,7 +270,7 @@ Only `pipe.to` and `pipe.expose` are strictly terminal.
 
 ```nix
 # Collect from host scopes only (destructures { host, ... })
-(pipe.collect ({ host, ... }: host.datacenter == sourceHost.datacenter))
+(pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
 
 # Collect from all host scopes
 (pipe.collect ({ host, ... }: true))
@@ -344,7 +344,7 @@ den.policies.app-config = { host, user, ... }:
 
     # Backends: collect from peers, filter, deliver to haproxy
     (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: host.datacenter == sourceHost.datacenter))
+      (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
       (pipe.to [ den.aspects.haproxy ])
     ])
   ];
@@ -553,9 +553,9 @@ den.policies.fleet-backends =
 den.policies.dc-backends =
   let inherit (den.lib.policy) pipe; in
   { host, ... }:
-  let sourceHost = host; in [
+  let receiver = host; in [
     (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: host.datacenter == sourceHost.datacenter))
+      (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
       (pipe.filter (b: b.port != 8081))
       (pipe.to [ den.aspects.haproxy ])
     ])
