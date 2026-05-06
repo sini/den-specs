@@ -266,6 +266,7 @@ pipe.from <pipe-ref> [ <stage> ... ]
 | `pipe.fold` | `(elem → acc → acc) → init → stage` | Reduce the list |
 | `pipe.append` | `value → stage` | Add a value to the list |
 | `pipe.for` | `(entries → value) → stage` | Final transform on the aggregate (at most one per pipe per scope) |
+| `pipe.withProvenance` | `→ stage` | Wrap each entry as `{ value, source }` where `source` is the emitting scope's context |
 
 ### Routing stages
 
@@ -314,6 +315,23 @@ Only `pipe.to` and `pipe.expose` are strictly terminal. `pipe.collect` composes 
 The predicate follows the same convention as policy signatures — entity kind matching via function args. The current scope is automatically excluded (a host doesn't collect from itself).
 
 `pipe.collect` reads from **already-walked pipeline state** — it does NOT re-walk peer scopes. All host scopes are subgraphs of one pipeline run and have already been walked by the time policies fire. `pipe.collect` reads `scopedClassImports.${peerScope}.${pipeName}` for matching scopes.
+
+### `pipe.withProvenance` — source context access
+
+Wraps each entry as `{ value, source }` where `source` is the scope context of the scope that emitted the quirk. Typically used after `pipe.collect` to annotate entries with their origin:
+
+```nix
+(pipe.from den.pipes.backup-targets [
+  (pipe.collect ({ host, ... }: true))
+  (pipe.withProvenance)
+  (pipe.transform (e: e.value // { source-host = e.source.host.name; }))
+  (pipe.to [ den.aspects.backup-server ])
+])
+```
+
+After the transform, the consumer sees flat entries with source metadata baked in. The provenance wrapper is an intermediate form — downstream stages (filter, transform, fold) operate on the wrapped shape until a transform unwraps it.
+
+`pipe.withProvenance` also works on local quirks (not just collected ones) — every entry has a source scope.
 
 ### `pipe.for` — aggregate transform
 
@@ -706,7 +724,7 @@ den.policies.production-firewall = { host, ... }:
 - **Collection strategies** — no `list`/`map`/`single` on the schema. Always a list. Consumers and policies transform as needed via `fold`/`for`.
 - **`_den.traits` injection modules** — no generated NixOS options. Pipe data is delivered via `wrapClassModule` pre-application and `bind` handlers, not through the module system's option machinery.
 - **Dynamic pipe registration** — no `register-pipe` effect during the walk. All pipes declared at `den.pipes` before the pipeline starts.
-- **Provenance in consumer API** — consumers see flat quirk values, not provenance wrappers. The pipeline tracks provenance internally for error messages. Consumer-facing provenance may be added later if needed.
+- **Provenance by default** — consumers see flat quirk values by default. `pipe.withProvenance` opts into provenance wrapping when source context is needed (e.g., annotating collected entries with their origin host).
 - **Multi-level expose** — `pipe.expose` pushes one level up. This may be revisited if the pattern proves too verbose.
 
 ---
