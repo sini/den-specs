@@ -168,9 +168,7 @@ neither             → unregistered class key (backwards compat default)
 
 Pipe keys and unregistered keys both flow through `emit-class` into `scopedClassImports.${scope}.${key}`. The distinction matters only at consumption time — `assemblePipes` reads pipe keys, the final output reads the target class.
 
-Implementation note: `classifyKeys` currently returns `{ classKeys, nestedKeys, unregisteredClassKeys }`. Pipe keys can be routed into `unregisteredClassKeys` (simplest — no structural change) or into a new `pipeKeys` return field (cleaner for the optimization of skipping class-wrapping on pipe entries). Either works for correctness since both paths reach `scopedClassImports`.
-
-Optional optimization: `wrapPerScope` could skip class-wrapping on pipe entries (they don't need module identity/location computation). Not required for correctness.
+Implementation: `classifyKeys` currently returns `{ classKeys, nestedKeys, unregisteredClassKeys }`. Pipe keys get a new `pipeKeys` return field. This allows `wrapPerScope` to skip class-wrapping on pipe entries (they don't need module identity/location computation). Pipe keys still flow through `emit-class` into `scopedClassImports` — the separate field only affects post-pipeline processing.
 
 ### 5.3 Collection
 
@@ -178,10 +176,10 @@ No change. `emit-class` with `class = "firewall"` deposits into `scopedClassImpo
 
 ### 5.4 Post-pipeline assembly
 
-`assemblePipes` runs BEFORE `wrapPerScope` — it produces pipe data that `wrapPerScope` then delivers via the existing `wrapClassModule` mechanism:
+`assemblePipes` runs BEFORE the existing post-pipeline phases — it augments scope contexts with pipe data, which `wrapPerScope` then delivers via `wrapClassModule`. The existing phases are NOT renumbered:
 
 ```
-phase0: assemblePipes       (build pipe data, inject into scope contexts) ← NEW
+NEW:    assemblePipes       (build pipe data, augment scope contexts)
 phase1: wrapPerScope        (class wrapping — ctx now includes pipe data)
 phase2: applyProvides       (policy.provide injection)
 phase3: applyRoutes         (forwards consume from scopedClassImports)
@@ -189,10 +187,10 @@ phase4: applyInstantiates   (entity instantiation)
 final:  imports = phase4.${class} or []
 ```
 
-`assemblePipes` takes `scopeContexts` from pipeline state and returns an augmented `scopeContexts'` with pipe data injected. This augmented version is passed to `wrapPerScope`:
+`assemblePipes` takes `scopeContexts` from pipeline state and returns an augmented version with pipe data added as keys. The augmented `scopeContexts` is passed to `wrapPerScope`, which passes it to `wrapClassModule`. Because pipe names appear as keys in the scope context, `wrapClassModule`'s existing `ctx ? ${k}` check detects them and pre-applies the data — no new delivery mechanism needed.
 
 ```nix
-# In fxResolve (resolve.nix):
+# In fxResolve (resolve.nix) — assemblePipes inserted before existing phases:
 let
   # assemblePipes references instantiatedConfigs (forward reference — Nix recursive let)
   augmentedScopeContexts = assemblePipes {
@@ -210,13 +208,12 @@ in ...
 `assemblePipes` steps:
 
 1. For each declared pipe, read raw entries from `scopedClassImports.${scope}.${pipeName}` per scope
-2. Apply `pipe.collect` effects — read quirks from matching peer scopes in already-walked pipeline state (no re-walking), merge into the pool
+2. Apply `pipe.collect` effects — read quirks from matching peer scopes' raw `scopedClassImports` entries (pre-assembly, not post-expose — collect and expose are independent)
 3. Apply policy pipe stages (filter, transform, fold, append, for) from `scopedPipeEffects`
 4. Resolve config-dependent thunks (see Section 5.5)
 5. Auto-flatten list-valued entries (thunk results that are lists are also flattened; non-list thunk results become single entries)
-6. Return augmented `scopeContexts` — pipe data injected per scope
-
-Because pipe data is in `scopeContexts` before `wrapPerScope` runs, class modules requesting `{ firewall, ... }:` get pipe args pre-applied through the existing `wrapClassModule` partial application — no new delivery mechanism needed.
+6. For every declared pipe in every scope, inject assembled data into `scopeContexts` — pipes with no emissions get `[]` (guarantees consumers always receive a list, never missing/null)
+7. Process `pipe.expose` effects bottom-up: merge exposed data into parent scope's pool before the parent's own assembly
 
 ### 5.5 Config-dependent thunk resolution
 
@@ -342,12 +339,14 @@ After the transform, the consumer sees flat entries with source metadata baked i
 (pipe.from den.pipes.secrets [
   (pipe.filter (_: false))
   (pipe.append { db-password = "/run/secrets/pg-pass"; })
-  (pipe.for (entries: lib.mergeAttrsList entries))
+  (pipe.for lib.mergeAttrsList)
   (pipe.to [ den.aspects.postgres ])
 ])
 ```
 
 After `pipe.for`, the consumer receives whatever the function returns — not necessarily a list. At most one `pipe.for` per pipe per scope; multiple is an error with provenance.
+
+**Override pattern:** `pipe.filter (_: false)` + `pipe.append` discards all emitted quirks and injects policy-constructed data. This is the standard way to deliver specific values to specific aspects — the policy replaces the pool entirely rather than filtering it. Used in the secrets examples below.
 
 ### `pipe.expose` — push to parent scope
 
@@ -453,7 +452,9 @@ When no quirks are emitted for a pipe, consumers receive `[]`.
 
 Pipe args are delivered through the existing `wrapClassModule` partial application mechanism. When a class module's function signature includes a declared pipe name, `wrapClassModule` pre-applies the assembled pipe data — same mechanism as entity context args (`host`, `user`).
 
-For pipeline-time discriminators, pipe data is available via the `bind` handler. The `bind` handler is extended to recognize pipe names: when a discriminator requests `{ firewall, ... }:` and `firewall` is not an entity context key but IS a declared pipe, `bind` defers the discriminator. The deferred discriminator is drained after `emitIncludes` completes for the current scope — at that point, all sibling aspects have emitted their quirks. The drain re-evaluates `bind` with the complete local pipe data from `scopedClassImports` for the current scope. This eliminates walk-order sensitivity for pipe-arg discriminators within a scope.
+For pipeline-time discriminators, pipe data is available via the `bind` handler. The `bind` handler is extended with a `pipeRegistry` check: when resolving function args, if a name is not a scope handler (entity context) but IS a key in `pipeRegistry` (the declared pipes set, available at pipeline construction time), `bind` reads the accumulated entries from `scopedClassImports.${currentScope}.${pipeName}` in pipeline state. However, this data may be incomplete during `emitIncludes` (not all sibling aspects have emitted yet).
+
+To eliminate walk-order sensitivity, pipe-arg discriminators are DEFERRED: when `bind` detects a pipe arg, it defers the discriminator (same mechanism as unsatisfied entity context args). The deferred discriminator is drained after `emitIncludes` completes for the current scope — at that point, all sibling aspects have emitted their quirks. The drain re-evaluates `bind`, which reads the now-complete local pipe data from `scopedClassImports`. This ensures discriminators see the full local quirk pool regardless of include order.
 
 ---
 
