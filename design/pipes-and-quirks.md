@@ -119,16 +119,21 @@ Quirks are **scope-local by default**. Data stays in the scope where it was emit
 Policies control data flow between scopes:
 
 - **Narrowing** — filter or target within a scope (`pipe.filter`, `pipe.to`)
-- **Widening** — expose data to the parent scope (`pipe.expose`)
+- **Collecting** — reach into peer scopes and harvest quirks (`pipe.collect`)
+- **Exposing** — push data up to parent scope (`pipe.expose`)
 - **Transforming** — modify data at scope boundaries (`pipe.transform`, `pipe.fold`)
 
 ```nix
-# Widen http-backends from host scope to fleet scope
-den.policies.fleet-backends = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
+# Collect http-backends from same-datacenter peers
+den.policies.dc-backends = { host, ... }:
+  let
+    inherit (den.lib.policy) pipe;
+    sameDC = builtins.filter
+      (h: h.datacenter == host.datacenter && h.name != host.name)
+      (builtins.attrValues den.hosts.x86_64-linux);
+  in [
     (pipe.from den.pipes.http-backends [
-      (pipe.transform (b: b // { source = host.name; }))
-      (pipe.expose)
+      (pipe.collect (map (peer: { host = peer; }) sameDC))
     ])
   ];
 
@@ -208,7 +213,7 @@ A pipe is constructed with `pipe.from` — a source pipe reference and an ordere
 pipe.from <pipe-ref> [ <stage> ... ]
 ```
 
-### Stages
+### Transform stages
 
 | Stage | Signature | Purpose |
 |-------|-----------|---------|
@@ -217,10 +222,22 @@ pipe.from <pipe-ref> [ <stage> ... ]
 | `pipe.fold` | `(elem → acc → acc) → init → stage` | Reduce the list |
 | `pipe.append` | `value → stage` | Add a value to the list |
 | `pipe.for` | `(entries → value) → stage` | Final transform on the aggregate (at most one per pipe per scope) |
-| `pipe.to` | `[ aspects ] → stage` | Destination: narrow delivery to specific aspects |
-| `pipe.expose` | `→ stage` | Push pipe data up to the parent scope (one level) |
 
-Stages apply in declared order within a single `pipe.from`. `pipe.to` and `pipe.expose` are terminal — they must be last if present. They are mutually exclusive: `pipe.to` narrows within the current scope, `pipe.expose` widens to the parent scope.
+### Routing stages (terminal)
+
+| Stage | Signature | Purpose |
+|-------|-----------|---------|
+| `pipe.to` | `[ aspects ] → stage` | Narrow delivery to specific aspects within current scope |
+| `pipe.expose` | `→ stage` | Push pipe data up to the parent scope (one level) |
+| `pipe.collect` | `[ entity-bindings ] → stage` | Resolve peer entity scopes, harvest their quirks into this scope |
+
+Stages apply in declared order within a single `pipe.from`. Routing stages are terminal — they must be last if present. Only one routing stage per `pipe.from`.
+
+- `pipe.to` narrows within the current scope
+- `pipe.expose` widens to the parent scope
+- `pipe.collect` reaches into peer scopes and brings their quirks back
+
+`pipe.collect` takes a list of entity bindings (same shape as `resolve.to`). Each binding creates a child scope, walks the entity, and collects quirks on this pipe. The collected values are unwrapped — consumers see flat quirk data, not provenance wrappers.
 
 ### No destination (scope-wide delivery)
 
@@ -452,7 +469,7 @@ den.aspects.postgres = {
 ```nix
 den.pipes.http-backends = { description = "HTTP backend endpoints"; };
 
-# Producers emit quirks (don't know about routing)
+# Producers — just data, no routing awareness
 den.aspects.nginx-backend = {
   nixos.services.nginx.enable = true;
   http-backends = { config, ... }: [{
@@ -461,35 +478,41 @@ den.aspects.nginx-backend = {
   }];
 };
 
-# Policy exposes each host's backends to fleet scope, annotated with source
-den.policies.fleet-backends = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.http-backends [
-      (pipe.transform (b: b // { source = host.name; datacenter = host.datacenter; }))
-      (pipe.expose)
-    ])
-  ];
-
-# Consumer sees all backends from fleet scope
+# Consumer — just consumption
 den.aspects.haproxy = {
   nixos = { http-backends, lib, ... }: {
     services.haproxy.enable = true;
     services.haproxy.config = lib.concatMapStringsSep "\n"
-      (b: "server ${b.source} ${b.addr}:${toString b.port}") http-backends;
+      (b: "server ${b.addr}:${toString b.port}") http-backends;
   };
 };
+
+# Policy — collect backends from ALL peer hosts
+den.policies.fleet-backends = { host, ... }:
+  let
+    inherit (den.lib.policy) pipe;
+    peers = builtins.filter (h: h.name != host.name)
+      (builtins.attrValues den.hosts.x86_64-linux);
+  in [
+    (pipe.from den.pipes.http-backends [
+      (pipe.collect (map (peer: { host = peer; }) peers))
+    ])
+  ];
 ```
 
 ### Cross-host loadbalancer with datacenter filtering
 
 ```nix
-# Same setup as above, but policy also filters by datacenter
+# Policy — collect backends only from same-datacenter peers
 den.policies.dc-backends = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
+  let
+    inherit (den.lib.policy) pipe;
+    sameDC = builtins.filter
+      (h: h.datacenter == host.datacenter && h.name != host.name)
+      (builtins.attrValues den.hosts.x86_64-linux);
+  in [
     (pipe.from den.pipes.http-backends [
-      (pipe.transform (b: b // { datacenter = host.datacenter; }))
-      (pipe.filter (b: b.datacenter == host.datacenter))
-      (pipe.expose)
+      (pipe.collect (map (peer: { host = peer; }) sameDC))
     ])
   ];
 ```
@@ -508,15 +531,19 @@ den.aspects.ssh-server = {
     }) (builtins.filter (k: k.type == "ed25519") config.services.openssh.hostKeys);
 };
 
-# Policy exposes host keys to fleet scope
+# Policy collects host keys from all peers
 den.policies.fleet-ssh-keys = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
+  let
+    inherit (den.lib.policy) pipe;
+    peers = builtins.filter (h: h.name != host.name)
+      (builtins.attrValues den.hosts.x86_64-linux);
+  in [
     (pipe.from den.pipes.ssh-host-keys [
-      (pipe.expose)
+      (pipe.collect (map (peer: { host = peer; }) peers))
     ])
   ];
 
-# Consumer sees all hosts' keys — forces lazily per host
+# Consumer sees all hosts' keys — config-dependent thunks force lazily
 den.aspects.known-hosts = {
   nixos = { ssh-host-keys, lib, ... }: {
     programs.ssh.knownHosts = lib.listToAttrs (map (k:
@@ -577,7 +604,7 @@ den.policies.production-firewall = { host, ... }:
 - **Collection strategies** — no `list`/`map`/`single` on the schema. Always a list. Consumers and policies transform as needed via `fold`/`for`.
 - **`_den.traits` injection modules** — no generated NixOS options. Pipe data is delivered via `wrapClassModule` pre-application and `bind` handlers, not through the module system's option machinery.
 - **Dynamic pipe registration** — no `register-pipe` effect during the walk. All pipes declared at `den.pipes` before the pipeline starts.
-- **Multi-level expose** — `pipe.expose` pushes one level up (to parent scope). Fleet-wide visibility requires a policy at each scope boundary. This may be revisited if the pattern proves too verbose.
+- **Provenance in consumer API** — consumers see flat quirk values, not provenance wrappers. The pipeline tracks provenance internally for error messages. Consumer-facing provenance may be added later if needed.
 
 ---
 
