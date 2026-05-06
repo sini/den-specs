@@ -189,34 +189,59 @@ phase4: applyInstantiates   (entity instantiation)
 final:  imports = phase4.${class} or []
 ```
 
-`assemblePipes`:
+`assemblePipes` takes `scopeContexts` from pipeline state and returns an augmented `scopeContexts'` with pipe data injected. This augmented version is passed to `wrapPerScope`:
+
+```nix
+# In fxResolve (resolve.nix):
+let
+  # assemblePipes references instantiatedConfigs (forward reference — Nix recursive let)
+  augmentedScopeContexts = assemblePipes {
+    inherit scopeContexts scopedClassImports scopedPipeEffects;
+    hostConfigs = instantiatedConfigs;  # lazy forward ref to phase4 output
+  };
+  phase1 = wrapPerScope ctx augmentedScopeContexts scopedClassImports;
+  phase2 = applyProvides ... phase1;
+  phase3 = applyRoutes ... phase2;
+  phase4 = applyInstantiates ... phase3;
+  instantiatedConfigs = extractLazyConfigs phase4;  # { scopeId → lazy config }
+in ...
+```
+
+`assemblePipes` steps:
 
 1. For each declared pipe, read raw entries from `scopedClassImports.${scope}.${pipeName}` per scope
-2. Apply `pipe.collect` effects — resolve peer scopes, read their quirks from already-walked pipeline state (no re-walking), merge into the pool
+2. Apply `pipe.collect` effects — read quirks from matching peer scopes in already-walked pipeline state (no re-walking), merge into the pool
 3. Apply policy pipe stages (filter, transform, fold, append, for) from `scopedPipeEffects`
 4. Resolve config-dependent thunks (see Section 5.5)
-5. Auto-flatten list-valued entries
-6. Inject assembled data into `scopeContexts` per scope — pipe data becomes part of the ctx that `wrapPerScope` passes to `wrapClassModule`
+5. Auto-flatten list-valued entries (thunk results that are lists are also flattened; non-list thunk results become single entries)
+6. Return augmented `scopeContexts` — pipe data injected per scope
 
 Because pipe data is in `scopeContexts` before `wrapPerScope` runs, class modules requesting `{ firewall, ... }:` get pipe args pre-applied through the existing `wrapClassModule` partial application — no new delivery mechanism needed.
 
 ### 5.5 Config-dependent thunk resolution
 
-A quirk like `http-backends = { config, ... }: [{ addr = config.networking.hostName; }]` is a function requiring NixOS `config`. During the walk, it is collected as-is (a bare function). During `assemblePipes`, it must be resolved.
+A quirk like `http-backends = { config, ... }: [{ addr = config.networking.hostName; }]` is a function requiring NixOS `config`. During the walk, it is collected as-is (a bare function). During `assemblePipes`, it must be resolved against the source scope's instantiated config.
 
-**Mechanism:** Each scope in the pipeline corresponds to an entity (host, user) that will be instantiated via `evalModules`. The instantiated configs are lazy — `nixosConfigurations.${hostName}.config` is a thunk that forces `evalModules` on first access. `assemblePipes` resolves config-dependent quirks by calling them with the source scope's lazy config reference:
+**Mechanism:** `assemblePipes` receives `hostConfigs` — a lazy forward reference to the instantiated configs produced by `applyInstantiates` (phase 4). This works via Nix's recursive `let`: `assemblePipes` stores the reference as a thunk, which is only forced when a consumer accesses the resolved value.
 
 ```nix
 # For each config-dependent entry in a scope:
-resolvedValue = entry.value { config = sourceHostConfig; lib = lib; };
-# sourceHostConfig = nixosConfigurations.${hostName}.config (lazy)
+resolvedValue = entry.value {
+  config = hostConfigs.${sourceScopeId};  # lazy — forces source host's evalModules on access
+  inherit lib;
+};
 ```
 
-The resolved value is itself lazy — Nix doesn't force `sourceHostConfig` until someone accesses fields on `resolvedValue`. When HOST-A's haproxy accesses `b.addr`, that forces HOST-B's `evalModules` through the lazy reference chain.
+The resolved value is itself lazy — Nix doesn't force the source config until someone accesses fields on `resolvedValue`. When HOST-A's haproxy accesses `b.addr`, that forces HOST-B's `evalModules` through the lazy reference chain:
+
+```
+HOST-A evalModules → haproxy module → http-backends list → resolvedValue.addr
+  → forces hostConfigs.${hostBScope} → HOST-B evalModules → config.networking.hostName
+```
 
 **Detection:** A quirk entry is config-dependent if it's a function whose args include module-system names (`config`, `lib`, `pkgs`, `options`, `modulesPath`). The same detection logic used by `wrapClassModule` applies.
 
-**Scope mapping:** `assemblePipes` needs to map each scope ID to its instantiated config reference. This is available from the `applyInstantiates` phase (which produces `nixosConfigurations.${name}`). Since `assemblePipes` runs before `applyInstantiates`, the config references must be computed lazily — Nix handles this naturally since both phases operate on the same lazy evaluation graph.
+**Mutual dependencies.** Two hosts can read each other's config-dependent quirks as long as they access different attributes. Nix evaluates attributes lazily and independently — `HOST-A.config.services.X` and `HOST-A.config.networking.Y` are separate thunks. True infinite recursion only occurs when the exact same attribute transitively depends on itself across hosts. This is the same constraint as NixOS module system self-references (`config.services.X` reading `config.services.Y` within the same host). Nix reports `infinite recursion encountered` with a stack trace identifying the cycle.
 
 ### 5.6 Policy pipe effect collection
 
@@ -262,7 +287,14 @@ Transform stages apply in declared order. Routing stages are terminal — at mos
 ])
 ```
 
-Only `pipe.to` and `pipe.expose` are strictly terminal.
+Only `pipe.to` and `pipe.expose` are strictly terminal. `pipe.collect` composes with `pipe.expose` — collect from peers then expose the combined result upward:
+
+```nix
+(pipe.from den.pipes.http-backends [
+  (pipe.collect ({ host, ... }: true))
+  (pipe.expose)
+])
+```
 
 ### `pipe.collect` — peer scope predicate
 
@@ -415,7 +447,7 @@ Both collect into `scopedClassImports`. The difference is consumption: classes f
 
 ### Pipes vs forwards/routes
 
-Forwards intercept class content and redirect it to another class at a path. Pipes intercept quirk data and deliver it as function args. Same collection infrastructure, different post-pipeline readers. Routes read `classImports.${fromClass}`; pipes read `classImports.${pipeName}`.
+Forwards intercept class content and redirect it to another class at a path. Pipes intercept quirk data and deliver it as function args. Same collection infrastructure (`scopedClassImports`), different post-pipeline readers. Routes read `scopedClassImports.*.${fromClass}`; pipes read `scopedClassImports.*.${pipeName}`.
 
 ### Pipes vs provides/\_
 
