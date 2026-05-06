@@ -729,7 +729,130 @@ den.policies.production-firewall = { host, ... }:
 
 ---
 
-## 11. Migration
+## 11. Implementation Phases
+
+Each phase is a shippable increment with its own test suite. Earlier phases are prerequisites for later ones. CI must pass at each phase boundary.
+
+### Phase 1: Registry + Classification (foundation)
+
+**Goal:** Pipe keys are recognized and collected separately from class keys. No consumption yet — quirks sit in `scopedClassImports` as inert data, same as today's unregistered keys.
+
+**Changes:**
+- Add `den.pipes` option (top-level, `lazyAttrsOf` metadata submodule)
+- Add `pipeRegistry` to `key-classification.nix` (read from `den.pipes`)
+- Update `classifyKeys` to return `pipeKeys` as a separate category
+- Pipe keys still flow through `emit-class` into `scopedClassImports`
+- Add collision assertion: `den.classes` and `den.pipes` must not overlap
+
+**Tests:** Declare `den.pipes.firewall`, put `firewall = { ports = [80]; }` on an aspect, verify it reaches `scopedClassImports` under the pipe key name. Verify class modules are NOT generated for pipe keys. Verify all existing tests pass unchanged (no behavioral change).
+
+**Why first:** Everything else depends on the registry existing and classification working. This is purely additive — zero risk to existing behavior.
+
+### Phase 2: Local scope consumption (the core value)
+
+**Goal:** Aspects on the same host can emit quirks and consume them as function args. This is the firewall aggregation use case — the highest-value scenario with the smallest surface area.
+
+**Changes:**
+- Add `assemblePipes` function (phase 0 in post-pipeline assembly)
+- `assemblePipes` reads pipe keys from `scopedClassImports`, assembles per-scope lists
+- Inject assembled pipe data into `scopeContexts` before `wrapPerScope`
+- Extend `wrapClassModule` to recognize pipe names alongside entity context args
+- Extend `bind` handler to recognize pipe names (for pipeline-time discriminators)
+- Implement pipe-arg deferral in `bind` (defer pipe args during `emitIncludes`, drain after)
+- Auto-flatten list-valued quirk entries
+
+**Tests:** Firewall aggregation (multiple aspects emit, one consumes on same host). Pipeline-time discriminator (capabilities gating). Empty pipe = `[]`. Diamond dependency dedup. Discriminator deferral (producer after discriminator in includes — verify correct result regardless of order).
+
+**Why second:** This delivers the core user value. Local-scope pipes with no policies, no cross-scope routing. Users can start using `den.pipes` + quirks immediately.
+
+### Phase 3: Policy pipe builder — transform stages
+
+**Goal:** Policies can filter, transform, fold, append, and aggregate pipe data within a scope.
+
+**Changes:**
+- Add `pipe` namespace to `den.lib.policy` (alongside existing `resolve`, `include`, `exclude`)
+- Implement `pipe.from` returning a single `__policyEffect = "pipe"` effect
+- Implement transform stages: `pipe.filter`, `pipe.transform`, `pipe.fold`, `pipe.append`, `pipe.for`
+- Add `scopedPipeEffects` state field (accumulated during walk, same pattern as `scopedRoutes`)
+- `assemblePipes` applies pipe effects per scope in declared order
+- Enforce `pipe.for` singularity (at most one per pipe per scope, error with provenance)
+
+**Tests:** Filter internal firewall entries. Transform to annotate. Fold to reduce to flat list. Append monitoring ports. `pipe.for` aggregate transform. `pipe.for` conflict error. Combined stage chain. Multiple `pipe.from` in one policy.
+
+**Why third:** Transform stages require the builder API and effect collection infrastructure. They build on phase 2's consumption mechanism. No cross-scope concerns yet — purely local data transformation.
+
+### Phase 4: Aspect targeting — `pipe.to`
+
+**Goal:** Policies can narrow pipe delivery to specific aspects. This is the secrets use case.
+
+**Changes:**
+- Implement `pipe.to [ aspects ]` as a terminal routing stage
+- `assemblePipes` tracks targeted vs untargeted pipe effects
+- Targeted delivery: pipe data injected per-aspect in `wrapClassModule` ctx (aspect identity available from class entry metadata)
+- Aspect-targeted takes precedence over scope-wide for the targeted aspect
+
+**Tests:** Secrets delivered to postgres only. Two policies targeting different aspects on same pipe. Two policies targeting same aspect (concatenation). Untargeted + targeted coexistence.
+
+**Why fourth:** Aspect targeting requires knowing which aspect each class module belongs to during `assemblePipes`. This is more complex than scope-wide delivery and should be validated after the basic mechanism is proven.
+
+### Phase 5: `pipe.expose` — upward scope flow
+
+**Goal:** Child scope data can be pushed to parent scope. This is the user-preferences-to-host use case.
+
+**Changes:**
+- Implement `pipe.expose` as a terminal routing stage
+- `assemblePipes` processes expose effects: after assembling a child scope's pipe data, merge exposed data into the parent scope's pool
+- Ordering: child scopes assemble before parents (bottom-up)
+
+**Tests:** User quirks exposed to host scope. Exposed data visible to host-scope consumers. Exposed data NOT visible to sibling scopes (only parent). Chain: user → host → fleet (two expose policies).
+
+**Why fifth:** Expose requires bottom-up assembly ordering in `assemblePipes`. This is a structural change to assembly logic that should come after the basic top-down flow is proven.
+
+### Phase 6: `pipe.collect` — peer scope harvesting
+
+**Goal:** Policies can reach into peer scopes and harvest their quirks. This is the cross-host service discovery use case.
+
+**Changes:**
+- Implement `pipe.collect (predicate)` as a non-terminal routing stage
+- Predicate receives peer scope context, matches via destructuring (`{ host, ... }:`)
+- `assemblePipes` evaluates collect predicates against all walked scopes
+- Auto-exclude current scope from collection
+- Dedup collected quirks by source scope + pipe name
+- Post-collect transform stages operate on combined pool (local + collected)
+
+**Tests:** Fleet-wide collection (all hosts). Filtered collection (same datacenter). Collect + filter composition. Self-exclusion. Dedup across overlapping policies. Collect from scope with no quirks = no contribution.
+
+**Why sixth:** Cross-scope collection is the most complex mechanism. It requires iterating all scopes and evaluating predicates. It should only be built after local-scope, targeting, and expose are all proven correct.
+
+### Phase 7: `pipe.withProvenance` + config-dependent thunks
+
+**Goal:** Full cross-host eval-time data flow. Source context access via provenance wrapping.
+
+**Changes:**
+- Implement `pipe.withProvenance` stage (wraps entries as `{ value, source }`)
+- Config-dependent thunk detection (function args include `config`, `lib`, etc.)
+- Config thunk resolution: lazy forward reference to instantiated configs via Nix recursive `let` in `fxResolve`
+- Auto-flatten thunk results that are lists
+
+**Tests:** SSH host keys (config-dependent thunk, list-valued, cross-host). Provenance wrapping + transform to extract source host. Thunk not forced until consumer access (verify laziness). Mutual dependency (two hosts reading each other's non-overlapping config attributes). Config thunk on same host (no cross-host, resolves in own fixpoint).
+
+**Why last:** Config-dependent thunks require the lazy forward reference to instantiated configs — the most subtle mechanism in the entire design. All other features should be stable before introducing this complexity. Most use cases (firewall, capabilities, secrets) work with static or parametric quirks and don't need this phase.
+
+### Phase summary
+
+| Phase | Feature | Key test scenario | Risk |
+|-------|---------|-------------------|------|
+| 1 | Registry + classification | Pipe key recognized, not emitted as class | Low — additive only |
+| 2 | Local consumption | Firewall aggregation on same host | Medium — new post-pipeline phase |
+| 3 | Transform stages | Filter + fold + combined chains | Low — builds on proven phase 2 |
+| 4 | `pipe.to` | Per-aspect secrets | Medium — aspect identity in assembly |
+| 5 | `pipe.expose` | User prefs to host scope | Medium — bottom-up assembly ordering |
+| 6 | `pipe.collect` | Cross-host service discovery | High — cross-scope predicate matching |
+| 7 | Provenance + thunks | Cross-host eval-time data | High — lazy forward references |
+
+---
+
+## 12. Migration
 
 ### From current state (no pipes)
 
