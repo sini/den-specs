@@ -442,7 +442,7 @@ den.aspects.hardened-server = {
 
 ### Pipeline-time vs eval-time
 
-- **Discriminators** (in `includes`): see concrete + parametric-resolved quirks collected so far in walk order. Config-dependent thunks are NOT forced — they appear as opaque values.
+- **Discriminators** (in `includes`): pipe-arg discriminators are DEFERRED during `emitIncludes` and drained after all sibling aspects in the current scope have emitted. This ensures they see the complete local quirk pool, not partial walk-order-dependent data. The existing bind/defer/drain lifecycle handles this: `bind` recognizes pipe args and defers them; the drain point after `emitIncludes` re-evaluates with the full scope data. Config-dependent thunks are NOT forced — they appear as opaque values.
 - **Class modules** (post-pipeline): see the full tree. All scopes walked. Policy pipe effects applied. Config-dependent thunks resolved via lazy config references (Section 5.5).
 
 ### Empty pipes
@@ -453,7 +453,7 @@ When no quirks are emitted for a pipe, consumers receive `[]`.
 
 Pipe args are delivered through the existing `wrapClassModule` partial application mechanism. When a class module's function signature includes a declared pipe name, `wrapClassModule` pre-applies the assembled pipe data — same mechanism as entity context args (`host`, `user`).
 
-For pipeline-time discriminators, pipe data is available via the `bind` handler. The `bind` handler is extended to resolve pipe names: when a discriminator requests `{ firewall, ... }:` and `firewall` is not an entity context key but IS a declared pipe, `bind` reads accumulated entries from `scopedClassImports` for the current scope. The discriminator sees whatever has been collected so far in walk order — this is partial data, same limitation as entity context during the walk.
+For pipeline-time discriminators, pipe data is available via the `bind` handler. The `bind` handler is extended to recognize pipe names: when a discriminator requests `{ firewall, ... }:` and `firewall` is not an entity context key but IS a declared pipe, `bind` defers the discriminator. The deferred discriminator is drained after `emitIncludes` completes for the current scope — at that point, all sibling aspects have emitted their quirks. The drain re-evaluates `bind` with the complete local pipe data from `scopedClassImports` for the current scope. This eliminates walk-order sensitivity for pipe-arg discriminators within a scope.
 
 ---
 
