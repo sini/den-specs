@@ -1,318 +1,355 @@
-# Aspect Compilation and Include Resolution
+# Aspect Compilation Pipeline
 
-**Date:** 2026-05-04
-**Branch:** feat/fx-pipeline (713/713 tests)
-**Scope:** How aspect attrsets become effect computations, how includes are resolved, and the narrow effect vocabulary that drives the pipeline.
-
----
-
-## 1. aspectToEffect: Aspect Attrset to Effect Computation
-
-**File:** `nix/lib/aspects/fx/aspect.nix`
-
-`aspectToEffect` is the entry point. It takes an aspect attrset and returns an `fx` computation (a free monad value). The function dispatches on one question: does the aspect have named arguments (`__args != {}`)?
-
-### Parametric path
-
-If `__args` is non-empty, the aspect is parametric -- it is a function waiting for arguments from scoped handlers.
-
-1. Guard against infinite recursion: `__parametricDepth` is incremented on each recursion and capped at 10.
-2. If the aspect has `__scopeHandlers`, wrap the resolution in `fx.effects.scope.provide` so those handlers are available to the inner computation.
-3. Resolve the function via `fx.bind.fn userArgs fn`. This is the nix-effects mechanism that performs the actual function application: it sends effects for each named argument, and the installed scoped handlers respond with values. The result is the function's return value.
-4. Build `next` from the result via `mkParametricNext`:
-   - If the result is still a function (curried), wrap it as a new parametric aspect with `__fn`/`__args`.
-   - If the result is a submodule function, merge it through the aspect type system.
-   - If the result is an attrset, merge it into the base.
-5. Tag the result via `tagParametricResult`: merge parent and resolved `__scopeHandlers`, propagate `__ctxId`, accumulate `__parametricResolvedArgs`.
-6. Recurse: call `aspectToEffect` on the tagged result. This loop continues until the aspect bottoms out as a static attrset.
-
-### Static path
-
-If `__args` is empty (or exhausted by parametric resolution), strip internal fields (`__fn`, `__args`, `__parametricDepth`, `__parametricResolvedArgs`) and call `compileStatic`.
+**Branch:** feat/fx-pipeline (753/753 tests)
+**Scope:** How aspect attrsets enter the pipeline via `resolve`, get dispatched to type-specific compilers, and produce class module emissions in scope-partitioned state.
 
 ---
 
-## 2. compileStatic: Key Classification and Emission
+## 1. Overview
 
-**File:** `nix/lib/aspects/fx/aspect.nix`, `nix/lib/aspects/fx/key-classification.nix`
+Every aspect enters the pipeline as a `resolve` effect. The resolve handler delegates to `compile`, which inspects the aspect's shape and dispatches to one of four compilers: `compile-static`, `compile-parametric`, `compile-forward`, or `compile-conditional`. Static compilation classifies the aspect's keys, emits class modules, processes nested sub-aspects, and resolves children (policies, includes, entity policies). Parametric compilation probes scope for required arguments, either binding the function and re-resolving the result or deferring the aspect for later drain. Forward compilation extracts route metadata and registers it in scoped state. Conditional compilation evaluates a guard predicate against the resolved path set.
 
-`compileStatic` processes a fully-resolved aspect attrset. It runs in three stages:
-
-### 2.1 Target class query
-
-Before classifying keys, `compileStatic` checks whether a `"class"` handler is installed (via `fx.effects.hasHandler`). If present, it sends a `"class"` effect to obtain the target class name. This is used during policy-driven resolution where the pipeline knows which class an aspect should emit into.
-
-### 2.2 Key classification (`classifyKeys`)
-
-**File:** `nix/lib/aspects/fx/key-classification.nix`
-
-All aspect keys are partitioned into four categories:
-
-- **Structural keys** (`structuralKeysSet`): `name`, `description`, `meta`, `includes`, `provides`, `policies`, `into`, `classes`, `__fn`, `__args`, `__functor`, `__functionArgs`, `__scopeHandlers`, `__ctxId`, `__entityKind`, `__parametricResolved`, `_module`, `_`. These are never emitted as classes or nested aspects -- they are consumed by the pipeline itself.
-
-- **Class keys**: Keys that appear in `den.classes` (the class registry) or match the `targetClass` from step 2.1.
-
-- **Nested keys**: Keys whose unwrapped value contains recognized sub-keys (registered classes). Detection is depth-limited to 3 levels. These become recursive `aspectToEffect` calls via `emitNestedAspect`.
-
-- **Unregistered class keys**: Everything else. Treated as classes for backward compatibility. When the class registry is empty (no batteries loaded), all non-structural keys fall back to class keys.
-
-### 2.3 Emission
-
-`compileStatic` emits three things in parallel via `fx.seq`:
-
-1. **Class emissions** (`emitClasses`): For each class key (registered + unregistered), unwrap the `aspectContentType` wrapper to a list of modules via `content-util.nix`, then send one `"emit-class"` effect per module element. Each emission carries:
-   - `class`: the class name (e.g., `"nixos"`, `"home"`)
-   - `identity`: the node identity (provider path + aspect name + optional index for multi-element values)
-   - `module`: the raw NixOS/HM module value
-   - `ctx`: context reconstructed from `__scopeHandlers` via `ctxFromHandlers`
-   - `aspectPolicy` / `globalPolicy`: collision policies for `wrapClassModule`
-   - `isContextDependent`: whether the aspect used context args during parametric resolution
-
-2. **Constraint registration** (`registerConstraints`): Sends `"register-constraint"` effects for `meta.handleWith` and `meta.excludes` entries. These feed the constraint system that can exclude or substitute includes.
-
-3. **Nested aspect recursion**: For each nested key, `emitNestedAspect` builds a sub-aspect (inheriting `__scopeHandlers`, `__ctxId`, and provider chain) and calls `aspectToEffect` on it.
-
-After emission, control flows to `resolveChildren`.
+Before any compiler runs, the **gate** composite checks for deduplication (scope-prefixed key in `includeSeen`) and constraint violations (exclude/substitute from the constraint registry). If the gate blocks, the entire subtree is skipped.
 
 ---
 
-## 3. resolveChildren: Processing Order
+## 2. Compile Router
 
-**File:** `nix/lib/aspects/fx/aspect.nix`
+**File:** `nix/lib/aspects/fx/handlers/compile.nix`
 
-`resolveChildren` processes the aspect's children in a fixed five-step sequence. Each step is chained via `fx.bind` (monadic sequencing), so they run in order:
+The `compile` handler receives `{ aspect, identity, ctx }` and inspects the aspect to select a compiler:
 
-### Step 1: emitSelfProvide (vestigial)
+| Condition | Effect dispatched |
+|---|---|
+| `meta.__forward` exists | `compile-forward` |
+| `meta.guard` exists | `compile-conditional` |
+| `__args` is non-empty | `compile-parametric` |
+| Otherwise | `compile-static` |
 
-**File:** `nix/lib/aspects/fx/include-emit.nix`
-
-If `aspect.provides.${aspect.name}` exists, emit it as an include. This is the legacy `provides` self-reference pattern: an aspect named `"foo"` with `provides.foo = ...` emits the self-provide as a child include to be resolved.
-
-The self-provide value can be a positional function (`fn ctx -> result`), a named-arg function (becomes parametric), or a static value. The result is sent as an `"emit-include"` effect which re-enters the classification pipeline.
-
-**Vestigial:** This mechanism exists solely for backward compatibility with the `provides` API. Pending provides removal (consolidated spec Section 5), aspects will use `policies` or direct `includes` instead.
-
-### Step 2: emitCrossProvideShims (vestigial)
-
-**File:** `nix/lib/aspects/fx/handlers/provides-compat.nix`
-
-For each key in `aspect.provides` that is NOT the aspect's own name and NOT a schema entity kind, emit a `"register-aspect-policy"` effect. Three variants:
-
-- `to-hosts`: Fires for every host/user pair, includes result at current scope.
-- `to-users`: Fires for every host/user pair, includes result at user scope.
-- Named target (e.g., `provides.myhost`): Fires only when `host.name` or `user.name` matches the key.
-
-Each emits a deprecation warning directing users to migrate to `policies`.
-
-**Vestigial:** Same as emitSelfProvide -- exists only for backward compatibility.
-
-### Step 3: emitAspectPolicies
-
-**File:** `nix/lib/aspects/fx/include-emit.nix`
-
-For each entry in `aspect.policies`, emit a `"register-aspect-policy"` effect. These are aspect-scoped policies (as opposed to global `den.policies`). The policy function and owner identity are registered for later dispatch by `installPolicies`.
-
-### Step 4: emitIncludes
-
-**File:** `nix/lib/aspects/fx/include-emit.nix`
-
-The core include resolution loop. Processes `aspect.includes` (a list) sequentially, classifying each child and dispatching it through the effect vocabulary. See Section 4 for the classification logic and Section 5 for the effect handlers.
-
-### Step 5: installPolicies (entity-only)
-
-**File:** `nix/lib/aspects/fx/policy-dispatch.nix`
-
-Only runs if the aspect has `__entityKind` (i.e., it is a schema entity root like a host or user). Dispatches global and aspect-scoped policies against the entity's context, creating new scopes via `scope.provide` for each entity resolution. This is where `policy.resolve`, `policy.include`, `policy.exclude`, and `policy.route` effects get materialized.
-
-### Chain wrapping
-
-If the aspect has a meaningful name (not `<anon>`, not synthetic), the entire `childResolution` computation is wrapped with `chain-push`/`chain-pop` effects. These maintain the includes chain for provenance tracking and anonymous child naming.
-
-### Completion
-
-After all children resolve, the aspect is marked complete via a `"resolve-complete"` effect (which updates the `pathSet` for conditional guard evaluation).
+The router forwards the entire `param` payload unchanged to the selected compiler. The `resolve` handler (`resolve.nix`) is a trivial indirection that sends `compile` with the same payload.
 
 ---
 
-## 4. emitIncludes: Include Classification
+## 3. Gate
 
-**File:** `nix/lib/aspects/fx/include-emit.nix`
+**Files:** `nix/lib/aspects/fx/handlers/gate.nix`, `nix/lib/aspects/fx/handlers/gate-tag.nix`
 
-`emitIncludes` iterates over an includes list, processing each child through a classification pipeline. For each child:
+The gate is a composite effect used by `compile-static` and `compile-parametric` (but not `compile-forward` or `compile-conditional`). It runs two checks in sequence:
 
-### 4.1 Wrapping (`wrapChild`)
+### 3.1 Dedup (check-dedup)
 
-Raw children are normalized into aspect attrsets:
-- **Attrsets with name + includes list**: passed through (already an aspect shape).
-- **Functors** (`__functor`): extract the inner function, detect submodule functions, set `__fn`/`__args`.
-- **Bare functions**: if submodule function, merge through `aspectType`; otherwise wrap as `{ name, meta, __fn, __args }`.
-- **Non-functions**: passed through as-is.
+Sends `check-dedup` with the aspect. Returns `{ isDuplicate, dedupKey }`. If `isDuplicate` is true, the gate returns `{ blocked = true; result = []; }` and the compiler produces nothing.
 
-Parent `__scopeHandlers` and `__ctxId` are propagated to children that don't already have them.
+See [check-dedup](#4a-dedup-key-construction) for key construction.
 
-### 4.2 Anonymous naming
+### 3.2 Constraint check (check-constraint)
 
-If the child has no meaningful name and `__skipNameAnon` is false, it gets a synthetic name based on the current chain position: `"<parent>/<anon>:<index>[/<ctxId>]"`.
+If dedup passes, sends `check-constraint` with `{ identity, aspect }`. Three outcomes:
 
-### 4.3 Classification and dispatch
+- **exclude**: Emits a tombstone via `resolve-complete`, optionally rolls back the dedup registration via `include-unseen` (if `dedupKey` is non-null). Returns `{ blocked = true; result = [tombstone]; }`.
+- **substitute**: Emits a tombstone for the original, then sends `resolve` for the replacement aspect. Returns `{ blocked = true; result = [tombstone] ++ replacementResult; }`.
+- **keep** (or with `owner`): Returns `{ passed = true; }`, optionally with `owner` for constraint tagging.
 
-Each wrapped child goes through this decision tree:
+### 3.3 Gate-tag wrapper
 
-1. **Dedup check** (`"check-dedup"` effect): If the child has already been seen in this scope, skip it entirely (return `[]`).
+`gate-tag.nix` provides `gateAndTag`, used by both static and parametric compilers. It skips the gate if `param.gated` is true (parametric re-entry after bind). On pass-through, if the gate returns an `owner`, the aspect's `meta.constraintOwner` is set. The tagged aspect is passed to the compiler's continuation.
 
-2. **Forward**: If `child.meta.__forward` exists, send `"emit-forward"` and return `[]`. Forwards are processed post-pipeline.
-
-3. **Conditional**: If `child.meta.guard` exists, send `"resolve-conditional"`. The handler evaluates the guard against the current path set.
-
-4. **Constraint check** (`"check-constraint"` effect): Tests against registered constraints (from `meta.handleWith`/`meta.excludes`). Three possible outcomes:
-   - `exclude`: Emit a tombstone, optionally unregister from `includeSeen`.
-   - `substitute`: Emit a tombstone for the original, resolve the replacement.
-   - `allow`: Continue to step 5.
-
-5. **Parametric vs static**: If `__args != {}`, send `"resolve-parametric"`; otherwise send `"resolve-aspect"`.
+See: [constraint-system.md](constraint-system.md)
 
 ---
 
-## 5. The Narrow Effect Vocabulary
+## 4. Static Compilation
 
-The pipeline uses four resolution effects (plus `check-dedup`). Each is handled by a dedicated handler module.
+**File:** `nix/lib/aspects/fx/handlers/compile-static.nix`
 
-### 5.1 resolve-aspect
+Static compilation processes fully-resolved aspect attrsets (no `__args`, no `__forward`, no `guard`). After gating, it runs:
 
-**File:** `nix/lib/aspects/fx/handlers/resolve-aspect.nix`
+### Step 1: Target class probe
 
-Static resolution. Calls `aspectToEffect` on the child and wraps the result in a singleton list. This is the simple case: the aspect is fully resolved and ready for compilation.
+Checks whether a `"class"` handler is installed via `fx.effects.hasHandler`. If present, sends a `"class"` effect to obtain a `targetClass` name. This is used during policy-driven resolution where the pipeline knows which class an aspect should emit into.
 
-### 5.2 resolve-parametric
+### Step 2: Classify keys
 
-**File:** `nix/lib/aspects/fx/handlers/resolve-parametric.nix`
+Sends a `"classify"` effect with `{ aspect, targetClass }`. The classify handler calls `classifyKeys` (see [Section 8](#8-key-classification)) and returns `{ classKeys, nestedKeys, pipeKeys }`. The classify handler merges `unregisteredClassKeys` into `classKeys`.
 
-Parametric resolution with deferral. The handler:
+### Step 3: Emit classes + constraints + nested aspects
 
-1. Determines which required arguments (non-default `__args` keys) lack scoped handlers -- both from `__scopeHandlers` on the child and from the ambient handler environment (probed via `fx.effects.hasHandler`).
+Runs in parallel via `fx.seq`:
 
-2. If all required args are available: calls `aspectToEffect` (which will resolve the function via `fx.bind.fn`), returns the result as a singleton list.
+- **emit-classes**: Sends `"emit-classes"` with `{ aspect, classKeys, pipeKeys, identity }`. See [emit-classes](#4b-emit-classes).
+- **registerConstraints**: Sends `"register-constraint"` effects for `meta.handleWith` and `excludes` entries.
+- **Nested keys**: For each nested key, builds a sub-aspect (inheriting `__scopeHandlers`, `__ctxId`, provider chain) and sends `"resolve"`.
 
-3. If any required args are unavailable: emits a stub tombstone via `"resolve-complete"`, then sends `"defer-include"` carrying the child and the list of missing `requiredArgs`. The child will be retried later when context widens (during entity resolution in `installPolicies`).
+### Step 4: Resolve children
 
-### 5.3 resolve-conditional
+Sends `"resolve-children"` with `{ aspect, isMeaningful, chainIdentity }`. See [Section 10](#10-resolve-children).
 
-**File:** `nix/lib/aspects/fx/handlers/resolve-conditional.nix`
+Returns `[ resolved ]` (singleton list of the resolved aspect with populated `includes`).
 
-Guard evaluation. The handler:
-
-1. Sends `"get-path-set"` to retrieve the set of all resolved aspect paths so far.
-2. Builds a `guardCtx` with `hasAspect` (checks path set membership).
-3. Calls `condNode.meta.guard guardCtx`. If it returns true, delegates the conditional's `meta.aspects` list to `emitIncludes`. If false, tombstones all aspects in the list.
-
-### 5.4 check-dedup
+### 4a. Dedup key construction
 
 **File:** `nix/lib/aspects/fx/handlers/check-dedup.nix`
 
-Include dedup via `includeSeen` state. Returns `{ isDuplicate, dedupKey }`:
+The dedup key is `"${scope}/${identityKey}"` where:
+- `scope` is `state.currentScope` (e.g., `"host:myhost"`)
+- `identityKey` is `identity.key child` (provider path + name + optional ctxId suffix)
 
-1. Computes a dedup key from the child's identity path, scoped by `state.currentScope`. Synthetic names (wrapped in `<>`) and anonymous children get `null` dedup keys (never deduplicated).
+Synthetic names (wrapped in `<>`) and non-meaningful names produce `null` dedup keys and are never deduplicated. On first encounter of a non-null key, the handler eagerly registers it in `state.includeSeen` (a thunked attrset). Rollback is possible via `include-unseen` when a constraint excludes a previously-registered child.
 
-2. Checks `state.includeSeen` for the scoped key.
+### 4b. Emit-classes
 
-3. If not a duplicate and key is non-null, eagerly registers the key in `includeSeen`. This prevents the same aspect from being resolved twice in the same scope.
+**File:** `nix/lib/aspects/fx/handlers/emit-classes.nix`
 
-The eager registration is paired with `"include-unseen"` (in the include handler), which can roll back a registration when a constraint excludes a child after it was already registered.
+For each class key and pipe key, unwraps the aspect content type to a list of modules via `unwrapContentValuesList`, then sends one `"emit-class"` effect per module element. Each emission carries:
 
----
+- `class`: the class name (e.g., `"nixos"`, `"home"`)
+- `identity`: node identity, with `[idx]` suffix for multi-element values
+- `module`: the raw NixOS/HM module value
+- `ctx`: context reconstructed from `__scopeHandlers` via `ctxFromHandlers`
+- `aspectPolicy` / `globalPolicy`: collision policies for `wrapClassModule`
+- `isContextDependent`: true when `__parametricResolvedArgs` overlap with context keys or `meta.contextDependent` is set
+- `__isPipeEntry`: true for pipe keys (these bypass class module wrapping)
 
-## 6. Include Dedup via includeSeen
-
-**File:** `nix/lib/aspects/fx/handlers/check-dedup.nix`, `nix/lib/aspects/fx/handlers/include.nix`
-
-The `includeSeen` state field is a thunked attrset (`_: { key = true; ... }`) tracking which aspects have been resolved in each scope.
-
-### Dedup key construction
-
-`dedupKey = "${scope}/${identity}"` where:
-- `scope` is `state.currentScope` (the entity scope ID, e.g., `"host:myhost"`)
-- `identity` is the aspect's path key (`provider/name` plus optional `{ctxId}` suffix)
-
-### Scope isolation
-
-The scope prefix ensures the same aspect can be resolved independently in different entity scopes. For example, `host:alpha/batteries/git` and `host:beta/batteries/git` are distinct dedup keys.
-
-### Rollback
-
-When `excludeChild` fires (from constraint checking), it sends `"include-unseen"` to remove the dedup key. This prevents a constraint-excluded aspect from blocking later legitimate inclusion of the same aspect.
+See: [class-module-wrapping.md](class-module-wrapping.md)
 
 ---
 
-## 7. Deferred Includes: Parametric Deferral and Drain
+## 5. Parametric Compilation
 
-When `resolve-parametric` encounters a child whose required arguments lack handlers, it defers the child:
+**File:** `nix/lib/aspects/fx/handlers/compile-parametric.nix`, `nix/lib/aspects/fx/handlers/bind.nix`
 
-1. Emits a stub via `"resolve-complete"` (so the path set records the attempt).
-2. Sends `"defer-include"` with the child and required args.
+Parametric compilation handles aspects with non-empty `__args` (function arguments awaiting resolution from scope handlers).
 
-### Drain mechanism
+### Depth guard
 
-Deferred includes are drained when entity context widens during `installPolicies`:
+Before any work, checks `__parametricDepth >= maxParametricDepth` (10). If exceeded, throws an error. The depth is incremented on each parametric recursion cycle.
 
-- `installPolicies` creates new scopes via `scope.provide` for each entity, installing `constantHandler`s for entity context keys (`host`, `user`, etc.).
-- After scope installation, deferred includes whose required args are now satisfied by the new handlers are retried.
-- Each retry re-enters the normal `aspectToEffect` path, where `fx.bind.fn` can now resolve the previously-missing arguments.
+### Gate
 
-This is the mechanism that allows parametric aspects like `{ host, ... }: { nixos = ...; }` to be included at the top level (where `host` is unavailable) and resolved later when a host entity scope provides the `host` handler.
+Runs `gateAndTag` (same as static). Skipped on parametric re-entry (`param.gated = true`).
 
----
+### Bind
 
-## 8. content-util.nix: Unwrapping aspectContentType
+Sends a `"bind"` effect with `{ aspect, compileFn }`. The bind handler (`bind.nix`) determines argument availability:
 
-**File:** `nix/lib/aspects/fx/content-util.nix`
+1. **Required keys**: Filters `__args` to keys where `!childArgs.${k}` (no default value).
+2. **Scope handler check**: Removes keys already present in `__scopeHandlers`.
+3. **State fallback**: At non-root scopes, checks `state.scopeContexts` for remaining keys.
+4. **Pipeline handler probe**: For any remaining keys, sequentially probes `fx.effects.hasHandler` for each key. If any probe fails, availability is false.
+5. **Pipe arg detection**: If any required key matches a name in `den.quirks`, unconditionally defers (pipe data is assembled post-pipeline).
 
-The aspect type system wraps values in `__contentValues` (a list of `{ value }` records from multi-site module definitions). `content-util.nix` provides four unwrap functions:
+If all required args are available:
+- Augments `__scopeHandlers` with state-context values for all requested keys (including optional ones)
+- Calls `compileFn` which runs `prepareParametricFn` (the actual `fx.bind.fn` call), builds `mkParametricBase` + `mkParametricNext` + `tagParametricResult`, increments depth
+- Returns `{ value = result; }`
 
-- `unwrapContentValues`: Filters empty attrsets, merges remainder. Single value returned directly; multiple values wrapped as `{ imports = vals; }`.
-- `unwrapContentValuesRaw`: No empty filtering. Used by `emitNestedAspect`.
-- `unwrapContentValuesList`: Returns a list of individual module values for per-element class emission. Lists pass through; `__contentValues` unwrap to filtered singleton or merged imports.
-- `unwrapContentValuesForClassification`: Merges all attrset values for sub-key detection in `classifyKeys`. Non-attrsets return `null`.
+If any required args are unavailable:
+- Sends `"defer"` with `{ child, requiredKeys, requiredArgs, hasPipeArgs }`
+- Returns `{ deferred = true; }`
 
----
+### Re-resolution
 
-## 9. Vestigial Components
+When bind returns `{ value }`, the parametric compiler sends `"resolve"` with the result and `gated = true` (to skip the gate on re-entry). This re-enters the compile router, which will dispatch to `compile-static` if args are exhausted, or `compile-parametric` again if still curried.
 
-Two steps in `resolveChildren` exist solely for backward compatibility with the `provides` API:
+### Defer
 
-### emitSelfProvide
+**File:** `nix/lib/aspects/fx/handlers/defer.nix`
 
-Translates `provides.${name}` into an include. When an aspect named `"foo"` has `provides.foo = { host, ... }: { nixos = ...; }`, the self-provide is emitted as a child include that re-enters the classification pipeline. The target state is for aspects to use `includes` directly or `policies` for cross-entity delivery.
-
-### emitCrossProvideShims
-
-Translates `provides.to-users`, `provides.to-hosts`, and named provides targets (`provides.myhost`) into aspect-scoped policies via `"register-aspect-policy"`. Each emits a deprecation warning. The target state is for aspects to use `aspect.policies` with explicit `policy.include` effects.
-
-Both are slated for removal once the 114 template `provides` occurrences are migrated (see provides removal plan).
+The defer handler emits a stub via `resolve-complete` (recording the attempt in the path set) and queues the child in `state.scopedDeferredIncludes` for the current scope. Deferred includes are drained when entity context widens during policy installation.
 
 ---
 
-## 10. Planned Redesign: Unified Resolve Effects
+## 6. Forward Compilation
 
-**Spec:** `design/unified-resolve-effects.md`
+**File:** `nix/lib/aspects/fx/handlers/compile-forward.nix`
 
-The current five-effect resolution vocabulary (`resolve-aspect`, `resolve-parametric`, `resolve-conditional`, `check-dedup`, `check-constraint`) will be refactored to a unified model:
+Forward compilation handles aspects where `meta.__forward` is set. It bypasses the gate entirely (no dedup or constraint checks).
 
-### Effects Replaced
+### Tier classification
 
-- `resolve-parametric` + `resolve-aspect` → unified `resolve` effect
-- `defer-include` → `defer` effect (with resolve-complete stub emission)
-- `drain-deferred` → `drain` effect (explicit) + `scope-widened` (automatic for simple cases)
-- Direct `compileStatic` call → `classify` + `emit-classes` + `resolve-children` effects
+The handler classifies the forward as Tier 1 (simple route) or complex:
 
-### Key Changes to This Document
+**Tier 1** requires all of:
+- `spec.canDirectImport && !spec.needsAdapter && !(spec.evalConfig or false)`
+- Source aspect has no `__scopeHandlers` (local origin)
+- Source class already exists in `state.scopedClassImports` for the current scope
 
-- **Section 1** (aspectToEffect): The function is eliminated. Callers send `fx.send "resolve"` instead. The `resolve` handler contains the parametric/static dispatch.
-- **Section 2** (compileStatic): Logic moves into the `resolve` handler's static path, decomposed into `classify`, `emit-classes`, and `resolve-children` effects.
-- **Section 3** (resolveChildren): Becomes the `resolve-children` handler. Receives `chainIdentity` + `identity` in payload.
-- **Section 4.3** (classification dispatch): Walker sends `resolve` for all non-forward, non-conditional children. No `isParametric` check.
-- **Section 5.1-5.2** (resolve-aspect, resolve-parametric): Deleted. Unified into `resolve` handler.
-- **Section 7** (deferred includes): The `bind` handler probes scope (via `fx.effects.hasHandler`), and on failure sends `defer`. Drain is automatic via `scope-widened` for simple scope entries, explicit for entity resolution.
+**Tier 1 route shape:**
+```
+{ fromClass, intoClass, path = spec.staticIntoPath, guard = null, adaptArgs = null, sourceScopeId = scope }
+```
 
-### Design Invariant
+**Complex route shape:**
+```
+spec // { sourceScopeId = scope, __complexForward = true }
+```
 
-Identity + ctx flow as payload data through the effect chain — handlers never call `identity.key` or `ctxFromHandlers` internally.
+### Route registration
+
+The route is appended to `state.scopedRoutes` for the current scope via `scopedAppend`. The handler resumes with `[]` (no child results).
+
+See: [routes-and-forwards.md](routes-and-forwards.md)
+
+---
+
+## 7. Conditional Compilation
+
+**File:** `nix/lib/aspects/fx/handlers/compile-conditional.nix`
+
+Conditional compilation handles aspects where `meta.guard` is set. It does not run the gate (conditionals have their own guard mechanism).
+
+### Guard evaluation
+
+1. Sends `"get-path-set"` to retrieve the set of all resolved aspect paths.
+2. Builds a `guardCtx` with `hasAspect = ref: pathSet ? ${identity.key ref}`.
+3. Calls `condNode.meta.guard guardCtx`.
+
+### Outcomes
+
+- **Guard passes**: Delegates `condNode.meta.aspects` to `emitIncludes` for normal resolution.
+- **Guard fails**: Emits tombstones for all aspects in `meta.aspects` via `resolve-complete`.
+
+---
+
+## 8. Key Classification
+
+**File:** `nix/lib/aspects/fx/key-classification.nix`
+
+`classifyKeys` partitions all non-structural aspect keys into four categories:
+
+### Structural keys (always excluded)
+
+`name`, `description`, `meta`, `includes`, `provides`, `policies`, `into`, `classes`, `__fn`, `__args`, `__functor`, `__functionArgs`, `__scopeHandlers`, `__ctxId`, `__entityKind`, `__parametricResolvedArgs`, `_module`, `_`
+
+### Classification logic
+
+When both `den.classes` and `den.quirks` registries are empty (no batteries), all non-structural keys become `classKeys` (backward-compatible fallback).
+
+When registries are populated:
+
+| Category | Test |
+|---|---|
+| **Pipe keys** | Key exists in `den.quirks` registry |
+| **Class keys** | Key exists in `den.classes` registry, or matches `targetClass` from class handler probe |
+| **Nested keys** | Remaining keys whose unwrapped value contains recognized sub-keys (class registry members), depth-limited to 3 levels via `hasRecognizedSubKeys` |
+| **Unregistered class keys** | Everything else (merged into `classKeys` by the classify handler) |
+
+The `classify` handler (`classify.nix`) consumes this and returns `{ classKeys = classified.classKeys ++ classified.unregisteredClassKeys; nestedKeys; pipeKeys }`.
+
+---
+
+## 9. Identity
+
+**File:** `nix/lib/aspects/fx/identity.nix`
+
+Identity computation provides the path-based naming used for dedup, provenance, and constraint matching.
+
+### aspectPath
+
+```
+aspectPath a = (a.meta.provider or []) ++ [a.name or "<anon>"] ++ optional (a ? __ctxId) "{${a.__ctxId}}"
+```
+
+Produces a list of path segments. Example: `["batteries" "git"]` or `["batteries" "ssh" "{myhost}"]`.
+
+### pathKey
+
+Joins a path list with `/`: `pathKey ["batteries" "git"] = "batteries/git"`.
+
+### key
+
+Composed: `key a = pathKey (aspectPath a)`. This is the primary identity string used throughout the pipeline.
+
+### Provider chain
+
+Nested aspects inherit their parent's provider chain. When `compile-static` builds a sub-aspect for a nested key `k`, it sets:
+```
+meta.provider = (aspect.meta.provider or []) ++ [aspect.name or "<anon>"]
+```
+
+### ctxId suffix
+
+Parametric aspects resolved in different contexts get a `{ctxId}` suffix in their identity, ensuring the same aspect resolved for different hosts/users gets distinct identity keys.
+
+### Utility functions
+
+- `isAnonIdentity`: True for non-meaningful names, `<root>/` prefixed, or `/<anon>:` containing identities.
+- `stripCtxSuffix`: Removes `/{ctxId}` suffix from an identity string.
+- `tombstone`: Creates an excluded marker node with `name = "~${originalName}"` and `meta.excluded = true`.
+- `collectPathsHandler`: Handles `resolve-complete` by recording the path (and base path without ctxId) in `state.pathSet`.
+- `pathSetHandler`: Handles `get-path-set` by returning the current `state.pathSet`.
+
+---
+
+## 10. Resolve-Children
+
+**File:** `nix/lib/aspects/fx/handlers/resolve-children.nix`, `nix/lib/aspects/fx/aspect/children.nix`, `nix/lib/aspects/fx/aspect/provide.nix`
+
+The `resolve-children` handler orchestrates the post-emission child processing sequence.
+
+### Chain wrapping
+
+If the aspect has a meaningful name, the entire child sequence is wrapped with `chain-push` / `chain-pop` effects. These maintain the includes chain for provenance tracking and anonymous child naming.
+
+### Child sequence
+
+The sequence runs three steps in order via `fx.bind`:
+
+1. **emitAspectPolicies** (`provide.nix`): Processes `aspect.provides` and `aspect.policies`.
+   - **Self-provide**: If `provides.${aspectName}` exists, emits it as an `"emit-include"` effect (re-enters the resolution pipeline). Handles positional functions, parametric wrappers, and static values.
+   - **Cross-provide shims**: For `provides` keys that are not the aspect's own name and not schema entity kinds, emits `"register-aspect-policy"` effects. Handles `to-hosts`, `to-users`, and named-target patterns.
+   - **Aspect policies**: Each entry in `aspect.policies` is registered via `"register-aspect-policy"`.
+
+2. **emitIncludes** (`children.nix`): Processes `aspect.includes` list sequentially. For each child:
+   - Policy values (`__isPolicy`) are routed to `"register-aspect-policy"` instead of the aspect walk.
+   - Lists are flattened, with policies extracted first.
+   - Non-policy children are wrapped (`wrapChild`), given anonymous names if needed, then dispatched via `"resolve"`.
+   - Parent `__scopeHandlers` and `__ctxId` propagate to children that lack them.
+
+3. **installPolicies** (entity-only): Only runs if `aspect.__entityKind` is set (schema entity root). Dispatches global and aspect-scoped policies against the entity context.
+
+### Completion
+
+After all children resolve, the handler sends `"resolve-complete"` with the aspect (recording it in the path set), then returns the resolved aspect with populated `includes`.
+
+See: [policy-system.md](policy-system.md), [scope-partitioning.md](scope-partitioning.md)
+
+---
+
+## 11. Invariants
+
+- **Dedup is scope-prefixed**: The dedup key is `"${currentScope}/${identityKey}"`. The same aspect resolved in different entity scopes (e.g., `host:alpha` vs `host:beta`) will not collide.
+- **Gate blocks entire subtree**: When the gate returns `{ blocked = true; }`, no children, nested aspects, or policies are processed. The compiler returns the gate's result directly.
+- **Parametric depth is bounded**: `maxParametricDepth = 10`. Exceeded depth throws, preventing infinite recursion from self-referential parametric aspects.
+- **Forward bypasses gate**: Forward compilation does not run dedup or constraint checks. Forwards are structural routing declarations, not aspect content.
+- **Conditional bypasses gate**: Conditional compilation uses its own guard mechanism instead of the standard gate.
+- **Eager dedup registration**: `check-dedup` registers the key in `includeSeen` on first encounter, before the aspect is fully resolved. This prevents concurrent resolution of the same aspect. Rollback via `include-unseen` handles constraint exclusions.
+- **Pipe args force deferral**: If any required argument matches a `den.quirks` pipe name, the bind handler unconditionally defers, because pipe data is assembled post-pipeline.
+
+---
+
+## 12. Key Files
+
+| File | Role |
+|---|---|
+| `handlers/compile.nix` | Shape router: dispatches to compile-{static,parametric,forward,conditional} |
+| `handlers/compile-static.nix` | Static compilation: gate, classify, emit-classes, nested, resolve-children |
+| `handlers/compile-parametric.nix` | Parametric compilation: gate, bind, re-resolve or defer |
+| `handlers/compile-forward.nix` | Forward compilation: tier classification, route registration |
+| `handlers/compile-conditional.nix` | Conditional compilation: guard evaluation against path set |
+| `handlers/gate.nix` | Gate composite: check-dedup then check-constraint |
+| `handlers/gate-tag.nix` | Shared gate+tag wrapper for static and parametric compilers |
+| `handlers/check-dedup.nix` | Dedup via scope-prefixed `includeSeen` state |
+| `handlers/constraint.nix` | Constraint registry: register-constraint, check-constraint |
+| `handlers/bind.nix` | Parametric bind: probe scope, call compileFn or defer |
+| `handlers/defer.nix` | Deferred include: stub + queue in scopedDeferredIncludes |
+| `handlers/emit-classes.nix` | Class/pipe emission: unwrap content, send emit-class per module |
+| `handlers/classify.nix` | Classify handler: calls classifyKeys, merges unregistered into classKeys |
+| `handlers/resolve.nix` | Resolve handler: trivial delegation to compile |
+| `handlers/resolve-children.nix` | Child orchestration: policies, includes, entity policies, completion |
+| `key-classification.nix` | Key classification: structural/class/pipe/nested/unregistered partitioning |
+| `identity.nix` | Identity: aspectPath, pathKey, key, tombstone, path set handlers |
+| `aspect/children.nix` | Include walker: wrapChild, anonymous naming, resolve dispatch |
+| `aspect/provide.nix` | Policy + provide emission: self-provide, cross-provide shims, aspect policies |
+
+All file paths are relative to `nix/lib/aspects/fx/`.
