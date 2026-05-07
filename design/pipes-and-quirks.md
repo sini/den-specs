@@ -1,425 +1,104 @@
-# Pipes and Quirks: Unified Data Flow
+# Pipes and Quirks
 
-**Date:** 2026-05-05
-**Status:** Design
-**Branch:** feat/fx-pipeline (713/713 tests)
-**Supersedes:** `design/traits.md`, `design/fleet-and-exports.md`, `tbd/emission-pipeline.md`
+**Component Reference** | feat/fx-pipeline (753/753 tests)
 
 ---
 
-## 1. Problem
+## 1. Overview
 
-Aspects emit content that falls into three semantic categories:
-
-- **Class modules** (`nixos`, `homeManager`) — functions evaluated by an external module system, becoming part of `config`
-- **Structured data** (`firewall`, `http-backends`, `secrets`) — data collected across aspects and delivered to consumers
-- **Nested aspects** (`tux`, `node-exporter`) — sub-aspects scoped to a named entity or feature
-
-Today, all non-structural keys emit as class modules. There is no mechanism to collect structured data across aspects and deliver it to consumers. An nginx aspect and a postgres aspect both know what firewall ports they need, but there is no way to aggregate that data and hand it to a firewall-configuration aspect. Each must independently set `networking.firewall.allowedTCPPorts` in a class module, with no coordination.
-
-### What the deleted trait system attempted
-
-The original trait implementation (2463 lines, deleted) solved this with three evaluation tiers, a DLQ, deferred thunk management, provide-to sub-pipelines, and `_den.traits` injection modules. It was architecturally fragile — every pipeline concern interacted with it.
-
-### What changed
-
-The pipeline rewrite introduced:
-- Dynamic context expansion (`push-scope`, `widen-context`, `enterScope`)
-- `bind` resolving against live state handlers
-- Scope-partitioned state with parent inheritance
-- All hosts as subgraphs of one pipeline run
-
-Most critically: **unregistered class keys are already collected into `scopedClassImports` and sit inert unless a post-pipeline phase reads them.** This is the same mechanism forwards/routes use. Pipes reuse it.
+Pipes are Den's named data channels for structured, non-class content. Aspects produce pipe data by setting keys on their attrset (called "quirks"); class modules consume aggregated pipe data as function arguments. Policies attach transform stages and cross-scope operations to pipes, controlling how data flows between scopes. Pipes reuse the existing `scopedClassImports` collection infrastructure -- pipe keys and class keys flow through the same `emit-class` handler, differing only at consumption time.
 
 ---
 
-## 2. Concepts
+## 2. Declaration
 
-### Quirk
-
-Structured data emitted by an aspect on a named key. The aspect doesn't know or care whether a pipe exists for that key — it just declares its data:
+Pipes are declared at `den.quirks` (the option-level name; internally referenced as `pipeRegistry`). Each declaration is minimal -- just metadata:
 
 ```nix
-den.aspects.nginx = {
-  nixos.services.nginx.enable = true;       # class module
-  firewall = { ports = [ 80 443 ]; };      # quirk
-};
-```
-
-A quirk can be:
-- A plain value (available at pipeline-time)
-- Parametric on den context (`{ host, ... }: { ports = [...]; }` — resolved during walk)
-- A config-dependent thunk (`{ config, ... }: { port = config.services.nginx.port; }` — collected as-is, resolved post-pipeline; see Section 5.5)
-
-**List-valued quirks are auto-flattened.** If a quirk value is a list, each element becomes a separate entry in the pipe. A quirk `firewall = [ { ports = [80]; } { ports = [443]; } ]` contributes two entries, not one list-in-a-list.
-
-### Pipe
-
-A declared data route. Establishes that a key name is a pipe, not a class:
-
-```nix
-den.pipes.firewall = {
+den.quirks.firewall = {
   description = "Firewall port declarations";
 };
 ```
 
-Top-level, declared by consumers. Complete before pipeline starts. The declaration is minimal — just metadata. No schema validation, no collection strategy. Quirks are always collected as a list; consumers transform however they want.
+The `den.quirks` option is `lazyAttrsOf` a submodule with a single `description` field. The `apply` function on the option:
 
-### Policy pipe builder
+1. Asserts that `den.classes` and `den.quirks` share no keys (collision = error).
+2. Injects a `name` field into each quirk value, matching its attribute name.
 
-A pipe is constructed as a sequence of stages with optional routing. The policy's own context (`{ host, user, ... }:`) determines WHERE and WHEN the pipe applies. The stages describe WHAT happens to the data. The optional routing stage controls WHERE it goes.
+### Ref syntax
 
-```nix
-den.policies.user-secret-filter = { host, user, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.secrets [
-      (pipe.filter (s: builtins.elem user.name (s.users or [])))
-      (pipe.transform (s: removeAttrs s [ "users" ]))
-      (pipe.to [ den.aspects.postgres den.aspects.nginx ])
-    ])
-  ];
-```
-
-Three orthogonal concerns:
-- **Where/when** — the policy's arg signature (fires at a scope boundary with specific context)
-- **What** — the pipe stages (filter, transform, fold, append)
-- **Who/where** — the optional routing stage (to, expose, collect)
-
----
-
-## 3. Three Roles
-
-| Role | Writes | Knows about |
-|------|--------|-------------|
-| **Producer** (aspect author) | Quirk data on a key | Nothing — just puts data on a key |
-| **Architect** (relationship author) | Pipe declaration + policy pipe builder | Which keys are pipes, how data flows between scopes |
-| **Consumer** (aspect author) | `{ firewall, ... }:` in signature | Pipe name — receives data as a function arg |
-
-The producer doesn't know about pipes. The consumer doesn't know about routing. The policy describes the relationship.
-
----
-
-## 4. Scope Model
-
-All hosts are subgraphs of one pipeline run:
-
-```
-flake (root scope)
-├── host:igloo (scope)
-│   ├── user:tux (scope)
-│   └── user:pingu (scope)
-├── host:iceberg (scope)
-│   └── user:alice (scope)
-```
-
-### Visibility
-
-Quirks are **scope-local by default**. Data stays in the scope where it was emitted. A host's quirks are visible to consumers within that host's scope, but NOT to other hosts or parent scopes. Cross-scope data flow requires explicit policy.
-
-### Policy-mediated flow
-
-Policies control data flow between scopes:
-
-- **Narrowing** — filter or target within a scope (`pipe.filter`, `pipe.to`)
-- **Collecting** — reach into peer scopes and harvest quirks (`pipe.collect`)
-- **Exposing** — push data up to parent scope (`pipe.expose`)
-- **Transforming** — modify data at scope boundaries (`pipe.transform`, `pipe.fold`)
+Because each quirk gets a `name` field, `den.quirks.firewall` can be passed directly to `pipe.from` as a ref instead of the string `"firewall"`. `pipe.from` accepts both:
 
 ```nix
-# Collect http-backends from same-datacenter peers
-den.policies.dc-backends =
-  let inherit (den.lib.policy) pipe; in
-  { host, ... }:
-  let receiver = host; in [
-    (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
-    ])
-  ];
+pipe.from "firewall" [ ... ]        # string name
+pipe.from den.quirks.firewall [ ... ] # ref (uses .name)
+```
 
-# Narrow secrets at host→user boundary
-den.policies.user-secrets = { host, user, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.secrets [
-      (pipe.filter (s: builtins.elem user.name (s.users or [])))
-      (pipe.to [ den.aspects.app ])
-    ])
-  ];
+Implementation in `policy-effects.nix`:
+
+```nix
+pipeName = if builtins.isAttrs pipeNameOrRef then pipeNameOrRef.name else pipeNameOrRef;
 ```
 
 ---
 
-## 5. Pipeline Mechanics
+## 3. Production
 
-### 5.1 Key insight: reuse `scopedClassImports`
-
-Unregistered class keys already collect into `scopedClassImports` and sit inert unless a post-pipeline phase reads them. Routes read `fromClass` and deposit into `intoClass`. Pipes add a new reader.
-
-No separate collection bucket. No separate emission handler. No separate walk-time infrastructure.
-
-### 5.2 Classification
-
-`classifyKeys` gains a third category:
-
-```
-key in den.classes  → class key (existing behavior)
-key in den.pipes    → pipe key (collected same as unregistered, consumed differently)
-neither             → unregistered class key (backwards compat default)
-```
-
-Pipe keys and unregistered keys both flow through `emit-class` into `scopedClassImports.${scope}.${key}`. The distinction matters only at consumption time — `assemblePipes` reads pipe keys, the final output reads the target class.
-
-Implementation: `classifyKeys` currently returns `{ classKeys, nestedKeys, unregisteredClassKeys }`. Pipe keys get a new `pipeKeys` return field. This allows `wrapPerScope` to skip class-wrapping on pipe entries (they don't need module identity/location computation). Pipe keys still flow through `emit-class` into `scopedClassImports` — the separate field only affects post-pipeline processing.
-
-### 5.3 Collection
-
-No change. `emit-class` with `class = "firewall"` deposits into `scopedClassImports.${scope}.firewall`. The existing scope-partitioned, thunk-wrapped, dedup-tracked infrastructure handles it.
-
-### 5.4 Post-pipeline assembly
-
-`assemblePipes` runs BEFORE the existing post-pipeline phases — it augments scope contexts with pipe data, which `wrapPerScope` then delivers via `wrapClassModule`. The existing phases are NOT renumbered:
-
-```
-NEW:    assemblePipes       (build pipe data, augment scope contexts)
-phase1: wrapPerScope        (class wrapping — ctx now includes pipe data)
-phase2: applyProvides       (policy.provide injection)
-phase3: applyRoutes         (forwards consume from scopedClassImports)
-phase4: applyInstantiates   (entity instantiation)
-final:  imports = phase4.${class} or []
-```
-
-`assemblePipes` takes `scopeContexts` from pipeline state and returns an augmented version with pipe data added as keys. The augmented `scopeContexts` is passed to `wrapPerScope`, which passes it to `wrapClassModule`. Because pipe names appear as keys in the scope context, `wrapClassModule`'s existing `ctx ? ${k}` check detects them and pre-applies the data — no new delivery mechanism needed.
+Aspects produce pipe data by setting a key matching a declared pipe name. The aspect does not need to know a pipe exists -- it just sets data on a key:
 
 ```nix
-# In fxResolve (resolve.nix) — assemblePipes inserted before existing phases:
-let
-  # assemblePipes references instantiatedConfigs (forward reference — Nix recursive let)
-  augmentedScopeContexts = assemblePipes {
-    inherit scopeContexts scopedClassImports scopedPipeEffects;
-    hostConfigs = instantiatedConfigs;  # lazy forward ref to phase4 output
-  };
-  phase1 = wrapPerScope ctx augmentedScopeContexts scopedClassImports;
-  phase2 = applyProvides ... phase1;
-  phase3 = applyRoutes ... phase2;
-  phase4 = applyInstantiates ... phase3;
-  instantiatedConfigs = extractLazyConfigs phase4;  # { scopeId → lazy config }
-in ...
-```
-
-`assemblePipes` steps:
-
-1. For each declared pipe, read raw entries from `scopedClassImports.${scope}.${pipeName}` per scope
-2. Apply `pipe.collect` effects — read quirks from matching peer scopes' raw `scopedClassImports` entries (pre-assembly, not post-expose — collect and expose are independent)
-3. Apply policy pipe stages (filter, transform, fold, append, for) from `scopedPipeEffects`
-4. Resolve config-dependent thunks (see Section 5.5)
-5. Auto-flatten list-valued entries (thunk results that are lists are also flattened; non-list thunk results become single entries)
-6. For every declared pipe in every scope, inject assembled data into `scopeContexts` — pipes with no emissions get `[]` (guarantees consumers always receive a list, never missing/null)
-7. Process `pipe.expose` effects bottom-up: merge exposed data into parent scope's pool before the parent's own assembly
-
-### 5.5 Config-dependent thunk resolution
-
-A quirk like `http-backends = { config, ... }: [{ addr = config.networking.hostName; }]` is a function requiring NixOS `config`. During the walk, it is collected as-is (a bare function). During `assemblePipes`, it must be resolved against the source scope's instantiated config.
-
-**Mechanism:** `assemblePipes` receives `hostConfigs` — a lazy forward reference to the instantiated configs produced by `applyInstantiates` (phase 4). This works via Nix's recursive `let`: `assemblePipes` stores the reference as a thunk, which is only forced when a consumer accesses the resolved value.
-
-```nix
-# For each config-dependent entry in a scope:
-resolvedValue = entry.value {
-  config = hostConfigs.${sourceScopeId};  # lazy — forces source host's evalModules on access
-  inherit lib;
+den.aspects.nginx = {
+  nixos.services.nginx.enable = true;   # class module (key in den.classes)
+  firewall = { ports = [ 80 443 ]; };  # quirk (key in den.quirks)
 };
 ```
 
-The resolved value is itself lazy — Nix doesn't force the source config until someone accesses fields on `resolvedValue`. When HOST-A's haproxy accesses `b.addr`, that forces HOST-B's `evalModules` through the lazy reference chain:
+### Key classification
 
-```
-HOST-A evalModules → haproxy module → http-backends list → resolvedValue.addr
-  → forces hostConfigs.${hostBScope} → HOST-B evalModules → config.networking.hostName
-```
+`classifyKeys` in `key-classification.nix` categorizes aspect keys into four groups:
 
-**Detection:** A quirk entry is config-dependent if it's a function whose args include module-system names (`config`, `lib`, `pkgs`, `options`, `modulesPath`). The same detection logic used by `wrapClassModule` applies.
+| Category | Condition | Behavior |
+|---|---|---|
+| `classKeys` | Key in `den.classes` or matches target class | Emitted as class module |
+| `pipeKeys` | Key in `den.quirks` | Emitted via `emit-class` into `scopedClassImports`, but NOT wrapped as class module |
+| `nestedKeys` | Contains recognized class sub-keys | Treated as nested aspect |
+| `unregisteredClassKeys` | None of the above | Emitted as class module (backwards compatibility) |
 
-**Mutual dependencies.** Two hosts can read each other's config-dependent quirks as long as they access different attributes. Nix evaluates attributes lazily and independently — `HOST-A.config.services.X` and `HOST-A.config.networking.Y` are separate thunks. True infinite recursion only occurs when the exact same attribute transitively depends on itself across hosts. This is the same constraint as NixOS module system self-references (`config.services.X` reading `config.services.Y` within the same host). Nix reports `infinite recursion encountered` with a stack trace identifying the cycle.
+Pipe keys flow through `emit-class` into `scopedClassImports.${scope}.${pipeName}` -- the same collection path as class content. The distinction matters only post-pipeline: `assemblePipes` reads pipe keys; `wrapPerScope` reads class keys.
 
-### 5.6 Policy pipe effect collection
+### Value forms
 
-During the walk, policies produce pipe effects alongside existing effects (resolve, include, exclude, etc.). A new effect type `__policyEffect = "pipe"` carries the pipe builder (source pipe ref, ordered stages, optional routing) and is collected into `scopedPipeEffects.${scope}` — same scope-partitioned state pattern as routes and provides.
+A quirk value can be:
 
----
-
-## 6. Pipe Builder API
-
-A pipe is constructed with `pipe.from` — a source pipe reference and an ordered list of stages. Each `pipe.from` call returns a single pipe effect. Stage ordering within the effect is guaranteed by the list.
-
-```nix
-pipe.from <pipe-ref> [ <stage> ... ]
-```
-
-### Transform stages
-
-| Stage | Signature | Purpose |
-|-------|-----------|---------|
-| `pipe.filter` | `(elem → bool) → stage` | Remove entries that don't match predicate |
-| `pipe.transform` | `(elem → elem) → stage` | Transform each entry |
-| `pipe.fold` | `(elem → acc → acc) → init → stage` | Reduce the list |
-| `pipe.append` | `value → stage` | Add a value to the list |
-| `pipe.for` | `(entries → value) → stage` | Final transform on the aggregate (at most one per pipe per scope) |
-| `pipe.withProvenance` | `→ stage` | Wrap each entry as `{ value, source }` where `source` is the emitting scope's context |
-
-### Routing stages
-
-| Stage | Signature | Purpose |
-|-------|-----------|---------|
-| `pipe.to` | `[ aspects ] → stage` | Narrow delivery to specific aspects within current scope |
-| `pipe.expose` | `→ stage` | Push pipe data up to the parent scope (one level) |
-| `pipe.collect` | `(peerCtx → bool) → stage` | Resolve matching peer scopes, harvest their quirks into this scope |
-
-Transform stages apply in declared order. Routing stages are terminal — at most one per `pipe.from`, must be last if present.
-
-**Exception:** `pipe.collect` is NON-terminal. Transform stages after `pipe.collect` operate on the combined pool (local quirks + collected peer quirks). This enables collect-then-filter patterns:
-
-```nix
-(pipe.from den.pipes.http-backends [
-  (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
-  (pipe.filter (b: b.port != 8080))
-  (pipe.to [ den.aspects.haproxy ])
-])
-```
-
-Only `pipe.to` and `pipe.expose` are strictly terminal. `pipe.collect` composes with `pipe.expose` — collect from peers then expose the combined result upward:
-
-```nix
-(pipe.from den.pipes.http-backends [
-  (pipe.collect ({ host, ... }: true))
-  (pipe.expose)
-])
-```
-
-### `pipe.collect` — peer scope predicate
-
-`pipe.collect` takes a predicate function that receives each peer scope's context. The pipeline iterates all walked scopes, calls the predicate with each scope's context, and harvests quirks from matching scopes. Entity kind filtering is implicit in the destructuring:
-
-```nix
-# Collect from host scopes only (destructures { host, ... })
-(pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
-
-# Collect from all host scopes
-(pipe.collect ({ host, ... }: true))
-
-# Collect from user scopes
-(pipe.collect ({ user, ... }: true))
-```
-
-The predicate follows the same convention as policy signatures — entity kind matching via function args. The current scope is automatically excluded (a host doesn't collect from itself).
-
-`pipe.collect` reads from **already-walked pipeline state** — it does NOT re-walk peer scopes. All host scopes are subgraphs of one pipeline run and have already been walked by the time policies fire. `pipe.collect` reads `scopedClassImports.${peerScope}.${pipeName}` for matching scopes.
-
-### `pipe.withProvenance` — source context access
-
-Wraps each entry as `{ value, source }` where `source` is the scope context of the scope that emitted the quirk. Typically used after `pipe.collect` to annotate entries with their origin:
-
-```nix
-(pipe.from den.pipes.backup-targets [
-  (pipe.collect ({ host, ... }: true))
-  (pipe.withProvenance)
-  (pipe.transform (e: e.value // { source-host = e.source.host.name; }))
-  (pipe.to [ den.aspects.backup-server ])
-])
-```
-
-After the transform, the consumer sees flat entries with source metadata baked in. The provenance wrapper is an intermediate form — downstream stages (filter, transform, fold) operate on the wrapped shape until a transform unwraps it.
-
-`pipe.withProvenance` also works on local quirks (not just collected ones) — every entry has a source scope.
-
-### `pipe.for` — aggregate transform
-
-`pipe.for` replaces the list with an arbitrary value. Useful when a consumer expects a single attrset rather than a list:
-
-```nix
-# Reduce to a single merged attrset
-(pipe.from den.pipes.secrets [
-  (pipe.filter (_: false))
-  (pipe.append { db-password = "/run/secrets/pg-pass"; })
-  (pipe.for lib.mergeAttrsList)
-  (pipe.to [ den.aspects.postgres ])
-])
-```
-
-After `pipe.for`, the consumer receives whatever the function returns — not necessarily a list. At most one `pipe.for` per pipe per scope; multiple is an error with provenance.
-
-**Override pattern:** `pipe.filter (_: false)` + `pipe.append` discards all emitted quirks and injects policy-constructed data. This is the standard way to deliver specific values to specific aspects — the policy replaces the pool entirely rather than filtering it. Used in the secrets examples below.
-
-### `pipe.expose` — push to parent scope
-
-```nix
-# User-scope data visible at host scope
-den.policies.user-prefs-to-host = { host, user, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.user-preferences [
-      (pipe.expose)
-    ])
-  ];
-```
-
-Pushes the pipe's data (after any preceding transform stages) up one level to the parent scope. The parent scope's consumers see the exposed data alongside their own local quirks.
-
-### No destination (scope-wide delivery)
-
-```nix
-# All consumers in this scope see the filtered firewall data
-(pipe.from den.pipes.firewall [
-  (pipe.filter (e: !(e.internal or false)))
-])
-```
-
-### Multiple pipes in one policy
-
-A policy can build multiple pipes:
-
-```nix
-den.policies.app-config = { host, user, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    # Firewall: scope-wide, add monitoring port
-    (pipe.from den.pipes.firewall [
-      (pipe.append { ports = [ 9100 ]; source = "monitoring"; })
-    ])
-
-    # Secrets: aspect-targeted, reduced to single attrset
-    (pipe.from den.pipes.secrets [
-      (pipe.filter (_: false))
-      (pipe.append { db-password = "/run/secrets/pg-pass"; })
-      (pipe.for lib.mergeAttrsList)
-      (pipe.to [ den.aspects.postgres ])
-    ])
-
-    # Backends: collect from peers, filter, deliver to haproxy
-    (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
-      (pipe.to [ den.aspects.haproxy ])
-    ])
-  ];
-```
-
-### Composability across policies
-
-Multiple policies can build pipes for the same pipe ref in the same scope:
-
-Each `pipe.from` is an independent effect that produces its own output by running its stages against the quirk pool. When multiple pipe effects target the same pipe ref in the same scope:
-
-- **Untargeted (no routing stage):** Each pipe effect runs independently against the pool. Results are merged — the consumer sees the union. `pipe.for` is singular per pipe ref per scope; multiple `pipe.for` across policies is an error with provenance.
-- **Different targets:** If Policy A targets `[postgres]` and Policy B targets `[nginx]`, each aspect receives only its respective pipe's output.
-- **Same target:** If two policies both target `[postgres]` on the same pipe, each pipe effect runs independently and the results are concatenated. Postgres sees the combined output.
-- **Duplicate collection:** If two policies both `pipe.collect` the same peers for the same pipe, collected quirks are deduplicated by source scope + pipe name (same quirk from the same scope is not counted twice).
+- **Plain value** -- available at pipeline time: `firewall = { ports = [ 80 ]; };`
+- **Parametric on den context** -- resolved during walk via `bind`: `firewall = { host, ... }: { ports = [...]; };`
+- **Config-dependent thunk** -- collected as-is, resolved post-pipeline: `http-backends = { config, ... }: [{ addr = config.networking.hostName; }];`
+- **List** -- auto-flattened: `firewall = [ { ports = [80]; } { ports = [443]; } ];` contributes two entries
 
 ---
 
-## 7. Consumption
+## 4. Consumption
 
-### Syntax
-
-Same everywhere: `{ pipeName, ... }:`
+Consumers receive pipe data as function arguments. The pipe name appears in the function signature:
 
 ```nix
-# Pipeline-time discriminator
+den.aspects.networking = {
+  nixos = { firewall, lib, ... }: {
+    networking.firewall.allowedTCPPorts =
+      lib.concatMap (f: f.ports or []) firewall;
+  };
+};
+```
+
+### Delivery mechanism
+
+Pipe data reaches consumers through two paths:
+
+**Class modules (post-pipeline):** `assemblePipes` injects assembled pipe data into `scopeContexts` as keys. `wrapClassModule` detects pipe names via its existing `ctx ? ${k}` check and pre-applies the data -- the same mechanism used for entity context args (`host`, `user`).
+
+**Pipeline-time discriminators (in `includes`):** The `bind` handler in `bind.nix` checks required args against `pipeRegistry`. When a pipe arg is detected, the aspect is unconditionally deferred (`hasPipeArgs = true`). Deferred pipe-arg aspects are drained after `assemblePipes` runs, when pipe data is available in the augmented scope contexts.
+
+```nix
 den.aspects.secure-server = {
   includes = [
     ({ firewall, ... }:
@@ -429,449 +108,260 @@ den.aspects.secure-server = {
       })
   ];
 };
-
-# Class module consumer
-den.aspects.hardened-server = {
-  nixos = { firewall, config, ... }: {
-    networking.firewall.allowedTCPPorts =
-      lib.concatMap (f: f.ports or []) firewall;
-  };
-};
 ```
 
-### Pipeline-time vs eval-time
+### Per-aspect targeting
 
-- **Discriminators** (in `includes`): pipe-arg discriminators are DEFERRED during `emitIncludes` and drained after all sibling aspects in the current scope have emitted. This ensures they see the complete local quirk pool, not partial walk-order-dependent data. The existing bind/defer/drain lifecycle handles this: `bind` recognizes pipe args and defers them; the drain point after `emitIncludes` re-evaluates with the full scope data. Config-dependent thunks are NOT forced — they appear as opaque values.
-- **Class modules** (post-pipeline): see the full tree. All scopes walked. Policy pipe effects applied. Config-dependent thunks resolved via lazy config references (Section 5.5).
+When `pipe.to` targets specific aspects, `assemblePipes` builds a `__pipeTargeted` map: `{ aspectIdentityKey -> { pipeName -> values } }`. During `wrapPerScope`, `applyPipeTargeting` in `wrap-classes.nix` overrides the scope-wide pipe data with targeted data for matching aspects, keyed by full identity pathkey (e.g., `"provider/postgres"`).
 
 ### Empty pipes
 
-When no quirks are emitted for a pipe, consumers receive `[]`.
-
-### Resolution via `wrapClassModule`
-
-Pipe args are delivered through the existing `wrapClassModule` partial application mechanism. When a class module's function signature includes a declared pipe name, `wrapClassModule` pre-applies the assembled pipe data — same mechanism as entity context args (`host`, `user`).
-
-For pipeline-time discriminators, pipe data is available via the `bind` handler. The `bind` handler is extended with a `pipeRegistry` check: when resolving function args, if a name is not a scope handler (entity context) but IS a key in `pipeRegistry` (the declared pipes set, available at pipeline construction time), `bind` reads the accumulated entries from `scopedClassImports.${currentScope}.${pipeName}` in pipeline state. However, this data may be incomplete during `emitIncludes` (not all sibling aspects have emitted yet).
-
-To eliminate walk-order sensitivity, pipe-arg discriminators are DEFERRED: when `bind` detects a pipe arg, it defers the discriminator (same mechanism as unsatisfied entity context args). The deferred discriminator is drained after `emitIncludes` completes for the current scope — at that point, all sibling aspects have emitted their quirks. The drain re-evaluates `bind`, which reads the now-complete local pipe data from `scopedClassImports`. This ensures discriminators see the full local quirk pool regardless of include order.
+Pipes with no emissions produce `[]`. Consumers always receive a value -- never missing or null.
 
 ---
 
-## 8. Relationship to Existing Systems
+## 5. Pipe Policy Effects
 
-### Pipes vs classes
+Policies attach transform and routing stages to pipes via `pipe.from`. The pipe builder API lives in the `pipe` namespace of `den.lib.policy` (defined in `policy-effects.nix`).
 
-Both collect into `scopedClassImports`. The difference is consumption: classes feed `evalModules` via `imports`, pipes deliver as function args. A key cannot be both — `den.classes` and `den.pipes` must not overlap.
+### `pipe.from`
 
-### Pipes vs forwards/routes
+```nix
+pipe.from <pipe-name-or-ref> [ <stage> ... ]
+```
 
-Forwards intercept class content and redirect it to another class at a path. Pipes intercept quirk data and deliver it as function args. Same collection infrastructure (`scopedClassImports`), different post-pipeline readers. Routes read `scopedClassImports.*.${fromClass}`; pipes read `scopedClassImports.*.${pipeName}`.
+Returns a single `{ __policyEffect = "pipe"; value = { pipeName, stages }; }` effect. The effect is collected into `scopedPipeEffects.${scope}` during the walk by the `register-pipe-effect` handler.
 
-### Pipes vs provides/\_
+### Transform stages
 
-Completely orthogonal. The `_`/`provides` namespace is for sub-aspect organization. Pipes are for structured data flow. A sub-aspect under `_` can emit quirks like any other aspect.
+Transform stages apply in declared order. Each operates on the current value list:
+
+| Stage | Signature | Behavior |
+|---|---|---|
+| `pipe.filter` | `(elem -> bool) -> stage` | Remove entries not matching predicate. Config thunk markers pass through unchanged. |
+| `pipe.transform` | `(elem -> elem) -> stage` | Map each entry. Config thunk markers pass through unchanged. |
+| `pipe.fold` | `(acc -> elem -> acc) -> init -> stage` | Reduce the list. Result is wrapped in a single-element list. Note: arg order is `(acc -> elem -> acc)` using `builtins.foldl'`. |
+| `pipe.append` | `value -> stage` | Append a value to the list. |
+| `pipe.for` | `(entries -> value) -> stage` | Replace the list with an arbitrary value. At most one per pipe per scope; multiple is an error with provenance (`__pipePolicyName`). |
+
+### Multi-policy composition
+
+Multiple policies can target the same pipe in the same scope:
+
+- **No `pipe.for`:** Each `pipe.from` effect runs independently on the base pool. Results are concatenated.
+- **With `pipe.for`:** At most one `pipe.for` effect per pipe per scope. If present, only that effect's stages run. Multiple `pipe.for` effects throw with policy names for diagnostics.
+- **Different `pipe.to` targets:** Each aspect receives only its respective effect's output.
+- **Same `pipe.to` target:** Results concatenate for that aspect.
 
 ---
 
-## 9. Examples
+## 6. Cross-Scope Operations
 
-### Firewall aggregation (single host)
-
-All aspects included on the same host — scope-local visibility is sufficient.
+### `pipe.collect`
 
 ```nix
-den.pipes.firewall = { description = "Firewall port declarations"; };
-
-den.hosts.x86_64-linux.igloo.users.tux = {};
-
-# Host aspect includes all relevant aspects
-den.aspects.igloo = {
-  includes = [
-    den.aspects.nginx
-    den.aspects.postgres
-    den.aspects.networking
-  ];
-};
-
-# Producers (don't know about pipes)
-den.aspects.nginx = {
-  nixos.services.nginx.enable = true;
-  firewall = { ports = [ 80 443 ]; };
-};
-den.aspects.postgres = {
-  nixos.services.postgresql.enable = true;
-  firewall = { ports = [ 5432 ]; };
-};
-
-# Consumer — same scope, sees all local quirks
-den.aspects.networking = {
-  nixos = { firewall, lib, ... }: {
-    networking.firewall.allowedTCPPorts =
-      lib.concatMap (f: f.ports or []) firewall;
-  };
-};
+pipe.collect (predicate) -> stage
 ```
 
-### Pipeline-time conditional inclusion
+Harvests quirk data from sibling scopes matching the predicate. Non-terminal -- transform stages after `pipe.collect` operate on the combined pool (local + collected).
+
+The predicate receives each sibling scope's context. Entity-kind filtering is implicit in the destructuring:
 
 ```nix
-den.pipes.firewall = { description = "Firewall port declarations"; };
+# Collect from host scopes only
+(pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
 
-den.aspects.secure-server = {
-  includes = [
-    ({ firewall, ... }:
-      let hasHttps = builtins.any (f: builtins.elem 443 (f.ports or [])) firewall;
-      in lib.optionalAttrs hasHttps {
-        includes = [ den.aspects.tls-hardening den.aspects.acme ];
-      })
-  ];
-};
+# Collect from all host scopes
+(pipe.collect ({ host, ... }: true))
 ```
 
-### Aspect-targeted secrets
+Implementation (`findMatchingSiblings` in `assemble-pipes.nix`):
+
+1. Find all scopes sharing the same parent via `scopeParent`.
+2. Exclude the current scope (self-exclusion).
+3. Extract entity kinds from the predicate's required function args.
+4. Reject scopes with extra entity kinds beyond what the predicate requires. A predicate `{ host, ... }:` matches only host-level scopes, even though user scopes also have `host` in their context -- the bidirectional entity-kind filter rejects user scopes because they have the extra `user` entity kind.
+5. Verify all required args are present in the candidate scope's context.
+6. Call the predicate; include scope if it returns `true`.
+
+For config-dependent entries in collected scopes, thunks are resolved eagerly using `hostConfigs` -- a set of lazily-instantiated NixOS configs per scope (see Section 7).
+
+### `pipe.expose`
 
 ```nix
-den.pipes.secrets = { description = "Per-aspect secret paths"; };
-
-# Policy constructs and delivers specific secrets to specific aspects
-den.policies.app-secrets = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.secrets [
-      (pipe.filter (_: false))
-      (pipe.append { db-password = "/run/secrets/pg-pass"; })
-      (pipe.for lib.mergeAttrsList)
-      (pipe.to [ den.aspects.postgres ])
-    ])
-    (pipe.from den.pipes.secrets [
-      (pipe.filter (_: false))
-      (pipe.append { cert-key = "/run/secrets/nginx-key"; })
-      (pipe.for lib.mergeAttrsList)
-      (pipe.to [ den.aspects.nginx ])
-    ])
-  ];
-
-# Each aspect receives a single attrset (not a list)
-den.aspects.postgres = {
-  nixos = { secrets, ... }: {
-    services.postgresql.settings.password_file = secrets.db-password;
-  };
-};
-den.aspects.nginx = {
-  nixos = { secrets, ... }: {
-    security.acme.certs."example.com".credentialFiles.key = secrets.cert-key;
-  };
-};
+pipe.expose -> stage
 ```
 
-### Cross-host loadbalancer
+Terminal routing stage. Pushes pipe data up one level to the parent scope. Transform stages before `pipe.expose` are applied first.
+
+Assembly processes expose effects bottom-up via `collectAllExposed`:
+
+1. Find root scopes (no parent or self-parented).
+2. Recursively process children before parents.
+3. For each scope with expose effects, apply transform stages to combined local + child-exposed data.
+4. Merge result into the parent scope's exposed pool.
+5. During final assembly (pass 2), exposed data merges into the parent scope's combined base alongside local quirks.
+
+Exposed data is visible only to the parent scope, not siblings.
+
+### `pipe.to`
 
 ```nix
-den.pipes.http-backends = { description = "HTTP backend endpoints"; };
+pipe.to [ aspects ] -> stage
+```
 
-# Producers — just data, no routing awareness
+Terminal routing stage. Narrows delivery to specific aspects within the current scope. Aspects are identified by their full identity pathkey via `den.lib.aspects.fx.identity.key`.
+
+### `pipe.withProvenance`
+
+```nix
+pipe.withProvenance -> stage
+```
+
+Wraps each entry as `{ value, source }` where `source` is the scope context of the emitting scope. When present, the entire stage pipeline operates on internally-tagged values (`{ __pv = value; __ps = scopeId; }`). The `withProvenance` stage converts these to the user-visible `{ value, source }` format. Filter and transform stages between `collect` and `withProvenance` operate on the inner `__pv` value transparently.
+
+```nix
+(pipe.from den.quirks.http-backends [
+  (pipe.collect ({ host, ... }: true))
+  (pipe.filter (b: b.port != 8080))     # operates on __pv internally
+  pipe.withProvenance                     # converts to { value, source }
+  (pipe.transform (e: e.value // { from = e.source.host.name; }))
+])
+```
+
+Works on local quirks too -- every entry has a source scope.
+
+---
+
+## 7. Config Thunks
+
+A quirk value that is a function with `config` in its args is a config-dependent thunk:
+
+```nix
 den.aspects.nginx-backend = {
-  nixos.services.nginx.enable = true;
   http-backends = { config, ... }: [{
     addr = config.networking.hostName;
     port = config.services.nginx.defaultHTTPListenPort;
   }];
 };
-
-# Consumer — just consumption
-den.aspects.haproxy = {
-  nixos = { http-backends, lib, ... }: {
-    services.haproxy.enable = true;
-    services.haproxy.config = lib.concatMapStringsSep "\n"
-      (b: "server ${b.addr}:${toString b.port}") http-backends;
-  };
-};
-
-# Policy — collect backends from ALL peer hosts
-den.policies.fleet-backends =
-  let inherit (den.lib.policy) pipe; in
-  { host, ... }: [
-    (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: true))
-    ])
-  ];
 ```
 
-### Cross-host loadbalancer with datacenter filtering
+### Detection
+
+`isConfigDependent` in `assemble-pipes.nix`: a value is config-dependent if `builtins.isFunction val && (builtins.functionArgs val) ? config`.
+
+### Resolution: two paths
+
+**Local thunks** (same-host): Marked with `{ __configThunk = true; __fn = v; }` during `assemblePipes`. Resolved inside `wrapClassModule` using the `evalModules` fixpoint `config`. This avoids a circular dependency: `assemblePipes` does not need the host's config to produce local pipe data.
+
+**Collected thunks** (cross-host via `pipe.collect`): Resolved eagerly in `collectFromPeers` using `hostConfigs` -- a set of lazily-instantiated NixOS configs built in `resolve.nix`. These configs use the original (non-augmented) scope contexts, breaking the cycle: `assemblePipes -> hostConfigs -> evalModules -> pipe data`.
+
+### Thunk function args
+
+Config thunks can take both pipeline args and `config`:
 
 ```nix
-# Policy — collect from same-datacenter peers, filter out health-check ports
-den.policies.dc-backends =
-  let inherit (den.lib.policy) pipe; in
-  { host, ... }:
-  let receiver = host; in [
-    (pipe.from den.pipes.http-backends [
-      (pipe.collect ({ host, ... }: host.datacenter == receiver.datacenter))
-      (pipe.filter (b: b.port != 8081))
-      (pipe.to [ den.aspects.haproxy ])
-    ])
-  ];
-```
-
-### Cross-host eval-time data (SSH host keys)
-
-```nix
-den.pipes.ssh-host-keys = { description = "SSH public host keys"; };
-
-# Each host emits its keys (config-dependent thunk — resolved lazily)
-den.aspects.ssh-server = {
-  ssh-host-keys = { config, ... }:
-    map (k: {
-      hostNames = [ config.networking.hostName ];
-      publicKey = builtins.readFile k.path;
-    }) (builtins.filter (k: k.type == "ed25519") config.services.openssh.hostKeys);
-};
-
-# Policy collects host keys from all peers
-den.policies.fleet-ssh-keys =
-  let inherit (den.lib.policy) pipe; in
-  { host, ... }: [
-    (pipe.from den.pipes.ssh-host-keys [
-      (pipe.collect ({ host, ... }: true))
-    ])
-  ];
-
-# Consumer — each entry is a single key record (list auto-flattened)
-den.aspects.known-hosts = {
-  nixos = { ssh-host-keys, lib, ... }: {
-    programs.ssh.knownHosts = lib.listToAttrs (map (k:
-      lib.nameValuePair (builtins.head k.hostNames) k
-    ) ssh-host-keys);
-  };
+host-info = { host, config, ... }: {
+  ${host.name} = config.networking.hostName;
 };
 ```
 
-### User-scoped secret filtering via policy
+The resolver provides scope context args (`host`, `user`, etc.) alongside `config` and `lib`.
 
-```nix
-den.pipes.secrets = { description = "Per-scope secrets"; };
+### Mutual dependencies
 
-# Host-level secrets emitted as quirks
-den.aspects.secret-store = {
-  secrets = [
-    { name = "db-pass"; path = "/run/secrets/db"; users = [ "admin" ]; }
-    { name = "api-key"; path = "/run/secrets/api"; users = null; }
-  ];
-};
-
-# Policy fires at host→user boundary, filters secrets for this user
-den.policies.user-secret-filter = { host, user, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.secrets [
-      (pipe.filter (s:
-        s.users == null || builtins.elem user.name s.users))
-    ])
-  ];
-```
-
-### Expose: user preferences visible to host scope
-
-```nix
-den.pipes.user-preferences = { description = "User preference declarations"; };
-
-# User aspect emits preferences
-den.aspects.tux = {
-  user-preferences = { editor = "vim"; shell = "zsh"; };
-};
-
-# Policy exposes user prefs to parent (host) scope
-den.policies.expose-user-prefs = { host, user, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.user-preferences [
-      (pipe.transform (p: p // { userName = user.name; }))
-      (pipe.expose)
-    ])
-  ];
-
-# Host-level consumer sees all users' preferences
-den.aspects.user-shell-setup = {
-  nixos = { user-preferences, lib, ... }: {
-    programs.zsh.enable = lib.any (p: p.shell == "zsh") user-preferences;
-    programs.fish.enable = lib.any (p: p.shell == "fish") user-preferences;
-  };
-};
-```
-
-### Combined transformation: annotate + filter + reduce
-
-```nix
-den.pipes.firewall = { description = "Firewall port declarations"; };
-
-den.policies.production-firewall = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from den.pipes.firewall [
-      # annotate each entry with source host
-      (pipe.transform (e: e // { source-host = host.name; }))
-      # drop internal-only entries
-      (pipe.filter (e: !(e.internal or false)))
-      # add monitoring ports
-      (pipe.append { ports = [ 9100 9090 ]; source = "monitoring"; })
-      # reduce to a flat port list
-      (pipe.fold (elem: acc: acc ++ (elem.ports or [])) [])
-    ])
-  ];
-```
+Two hosts can read each other's config-dependent quirks as long as they access different attributes. Nix evaluates attributes lazily -- `HOST-A.config.services.X` and `HOST-B.config.networking.Y` are separate thunks. Infinite recursion occurs only when the exact same attribute transitively depends on itself across hosts.
 
 ---
 
-## 10. Non-Goals
+## 8. Assembly
 
-- **Pipe schema validation** — pipes don't validate quirk shape. Quirks are arbitrary data. Consumers handle the structure.
-- **Collection strategies** — no `list`/`map`/`single` on the schema. Always a list. Consumers and policies transform as needed via `fold`/`for`.
-- **`_den.traits` injection modules** — no generated NixOS options. Pipe data is delivered via `wrapClassModule` pre-application and `bind` handlers, not through the module system's option machinery.
-- **Dynamic pipe registration** — no `register-pipe` effect during the walk. All pipes declared at `den.pipes` before the pipeline starts.
-- **Provenance by default** — consumers see flat quirk values by default. `pipe.withProvenance` opts into provenance wrapping when source context is needed (e.g., annotating collected entries with their origin host).
-- **Multi-level expose** — `pipe.expose` pushes one level up. This may be revisited if the pattern proves too verbose.
+`assemblePipes` in `assemble-pipes.nix` runs before the existing post-pipeline phases. It takes `scopeContexts`, `scopedClassImports`, `scopedPipeEffects`, `scopeParent`, and `hostConfigs`, and returns augmented scope contexts with pipe data added as keys.
 
----
+### Pipeline position
 
-## 11. Implementation Phases
+```
+assemblePipes       → augmented scope contexts with pipe data
+wrapPerScope        → class wrapping (ctx now includes pipe data)
+drain deferred      → pipe-arg deferred includes resolved
+applyProvides       → policy.provide injection
+applyRoutes         → forwards consume from scopedClassImports
+applyInstantiates   → entity instantiation
+```
 
-Each phase is a shippable increment with its own test suite. Earlier phases are prerequisites for later ones. CI must pass at each phase boundary.
+### Two-pass algorithm
 
-### Phase 1: Registry + Classification (foundation)
+**Pass 1 (`collectAllExposed`):** Bottom-up traversal collecting exposed data from child scopes. For each scope with `pipe.expose` effects, applies transform stages to combined local + child-exposed data and merges result into parent scope's pool.
 
-**Goal:** Pipe keys are recognized and collected separately from class keys. No consumption yet — quirks sit in `scopedClassImports` as inert data, same as today's unregistered keys.
+**Pass 2 (`mapAttrs`):** For each scope and each declared pipe:
 
-**Changes:**
-- Add `den.pipes` option (top-level, `lazyAttrsOf` metadata submodule)
-- Add `pipeRegistry` to `key-classification.nix` (read from `den.pipes`)
-- Update `classifyKeys` to return `pipeKeys` as a separate category
-- Pipe keys still flow through `emit-class` into `scopedClassImports`
-- Add collision assertion: `den.classes` and `den.pipes` must not overlap
+1. Read raw entries from `scopedClassImports.${scope}.${pipeName}`.
+2. Flatten and extract values (`flattenAndExtract`).
+3. Mark local config thunks for deferred resolution (`markConfigThunks`).
+4. Merge exposed data from children.
+5. Partition scope effects into untargeted and targeted.
+6. Apply untargeted effects via `applyPipeEffects` (or pass through combined base if none).
+7. Build `__pipeTargeted` from targeted effects via `buildTargetedData`.
+8. Set `__pipeConfigThunks` flags for pipes containing config thunk markers.
+9. Merge all pipe data into the scope context attrset.
 
-**Tests:** Declare `den.pipes.firewall`, put `firewall = { ports = [80]; }` on an aspect, verify it reaches `scopedClassImports` under the pipe key name. Verify class modules are NOT generated for pipe keys. Verify all existing tests pass unchanged (no behavioral change).
+### Early exit
 
-**Why first:** Everything else depends on the registry existing and classification working. This is purely additive — zero risk to existing behavior.
-
-### Phase 2: Local scope consumption (the core value)
-
-**Goal:** Aspects on the same host can emit quirks and consume them as function args. This is the firewall aggregation use case — the highest-value scenario with the smallest surface area.
-
-**Changes:**
-- Add `assemblePipes` function (phase 0 in post-pipeline assembly)
-- `assemblePipes` reads pipe keys from `scopedClassImports`, assembles per-scope lists
-- Inject assembled pipe data into `scopeContexts` before `wrapPerScope`
-- Extend `wrapClassModule` to recognize pipe names alongside entity context args
-- Extend `bind` handler to recognize pipe names (for pipeline-time discriminators)
-- Implement pipe-arg deferral in `bind` (defer pipe args during `emitIncludes`, drain after)
-- Auto-flatten list-valued quirk entries
-
-**Tests:** Firewall aggregation (multiple aspects emit, one consumes on same host). Pipeline-time discriminator (capabilities gating). Empty pipe = `[]`. Diamond dependency dedup. Discriminator deferral (producer after discriminator in includes — verify correct result regardless of order).
-
-**Why second:** This delivers the core user value. Local-scope pipes with no policies, no cross-scope routing. Users can start using `den.pipes` + quirks immediately.
-
-### Phase 3: Policy pipe builder — transform stages
-
-**Goal:** Policies can filter, transform, fold, append, and aggregate pipe data within a scope.
-
-**Changes:**
-- Add `pipe` namespace to `den.lib.policy` (alongside existing `resolve`, `include`, `exclude`)
-- Implement `pipe.from` returning a single `__policyEffect = "pipe"` effect
-- Implement transform stages: `pipe.filter`, `pipe.transform`, `pipe.fold`, `pipe.append`, `pipe.for`
-- Add `scopedPipeEffects` state field (accumulated during walk, same pattern as `scopedRoutes`)
-- `assemblePipes` applies pipe effects per scope in declared order
-- Enforce `pipe.for` singularity (at most one per pipe per scope, error with provenance)
-
-**Tests:** Filter internal firewall entries. Transform to annotate. Fold to reduce to flat list. Append monitoring ports. `pipe.for` aggregate transform. `pipe.for` conflict error. Combined stage chain. Multiple `pipe.from` in one policy.
-
-**Why third:** Transform stages require the builder API and effect collection infrastructure. They build on phase 2's consumption mechanism. No cross-scope concerns yet — purely local data transformation.
-
-### Phase 4: Aspect targeting — `pipe.to`
-
-**Goal:** Policies can narrow pipe delivery to specific aspects. This is the secrets use case.
-
-**Changes:**
-- Implement `pipe.to [ aspects ]` as a terminal routing stage
-- `assemblePipes` tracks targeted vs untargeted pipe effects
-- Targeted delivery: pipe data injected per-aspect in `wrapClassModule` ctx (aspect identity available from class entry metadata)
-- Aspect-targeted takes precedence over scope-wide for the targeted aspect
-
-**Tests:** Secrets delivered to postgres only. Two policies targeting different aspects on same pipe. Two policies targeting same aspect (concatenation). Untargeted + targeted coexistence.
-
-**Why fourth:** Aspect targeting requires knowing which aspect each class module belongs to during `assemblePipes`. This is more complex than scope-wide delivery and should be validated after the basic mechanism is proven.
-
-### Phase 5: `pipe.expose` — upward scope flow
-
-**Goal:** Child scope data can be pushed to parent scope. This is the user-preferences-to-host use case.
-
-**Changes:**
-- Implement `pipe.expose` as a terminal routing stage
-- `assemblePipes` processes expose effects: after assembling a child scope's pipe data, merge exposed data into the parent scope's pool
-- Ordering: child scopes assemble before parents (bottom-up)
-
-**Tests:** User quirks exposed to host scope. Exposed data visible to host-scope consumers. Exposed data NOT visible to sibling scopes (only parent). Chain: user → host → fleet (two expose policies).
-
-**Why fifth:** Expose requires bottom-up assembly ordering in `assemblePipes`. This is a structural change to assembly logic that should come after the basic top-down flow is proven.
-
-### Phase 6: `pipe.collect` — peer scope harvesting
-
-**Goal:** Policies can reach into peer scopes and harvest their quirks. This is the cross-host service discovery use case.
-
-**Changes:**
-- Implement `pipe.collect (predicate)` as a non-terminal routing stage
-- Predicate receives peer scope context, matches via destructuring (`{ host, ... }:`)
-- `assemblePipes` evaluates collect predicates against all walked scopes
-- Auto-exclude current scope from collection
-- Dedup collected quirks by source scope + pipe name
-- Post-collect transform stages operate on combined pool (local + collected)
-
-**Tests:** Fleet-wide collection (all hosts). Filtered collection (same datacenter). Collect + filter composition. Self-exclusion. Dedup across overlapping policies. Collect from scope with no quirks = no contribution.
-
-**Why sixth:** Cross-scope collection is the most complex mechanism. It requires iterating all scopes and evaluating predicates. It should only be built after local-scope, targeting, and expose are all proven correct.
-
-### Phase 7: `pipe.withProvenance` + config-dependent thunks
-
-**Goal:** Full cross-host eval-time data flow. Source context access via provenance wrapping.
-
-**Changes:**
-- Implement `pipe.withProvenance` stage (wraps entries as `{ value, source }`)
-- Config-dependent thunk detection (function args include `config`, `lib`, etc.)
-- Config thunk resolution: lazy forward reference to instantiated configs via Nix recursive `let` in `fxResolve`
-- Auto-flatten thunk results that are lists
-
-**Tests:** SSH host keys (config-dependent thunk, list-valued, cross-host). Provenance wrapping + transform to extract source host. Thunk not forced until consumer access (verify laziness). Mutual dependency (two hosts reading each other's non-overlapping config attributes). Config thunk on same host (no cross-host, resolves in own fixpoint).
-
-**Why last:** Config-dependent thunks require the lazy forward reference to instantiated configs — the most subtle mechanism in the entire design. All other features should be stable before introducing this complexity. Most use cases (firewall, capabilities, secrets) work with static or parametric quirks and don't need this phase.
-
-### Phase summary
-
-| Phase | Feature | Key test scenario | Risk |
-|-------|---------|-------------------|------|
-| 1 | Registry + classification | Pipe key recognized, not emitted as class | Low — additive only |
-| 2 | Local consumption | Firewall aggregation on same host | Medium — new post-pipeline phase |
-| 3 | Transform stages | Filter + fold + combined chains | Low — builds on proven phase 2 |
-| 4 | `pipe.to` | Per-aspect secrets | Medium — aspect identity in assembly |
-| 5 | `pipe.expose` | User prefs to host scope | Medium — bottom-up assembly ordering |
-| 6 | `pipe.collect` | Cross-host service discovery | High — cross-scope predicate matching |
-| 7 | Provenance + thunks | Cross-host eval-time data | High — lazy forward references |
+If `pipeNames == []` (no pipes declared), `assemblePipes` returns `scopeContexts` unchanged.
 
 ---
 
-## 12. Migration
+## 9. Invariants
 
-### From current state (no pipes)
+- **Pipes are not classes.** `den.classes` and `den.quirks` must not share keys. Enforced by assertion in the `den.quirks` option `apply` function.
+- **Bidirectional entity-kind filter.** `pipe.collect` predicates match scopes by entity kind via function arg destructuring. A `{ host, ... }:` predicate matches only host-level scopes -- user scopes are rejected even though they have `host` in context, because they carry extra entity kinds (`user`) not required by the predicate.
+- **Self-exclusion.** `findMatchingSiblings` always excludes the current scope from collection. A host never collects from itself.
+- **Sibling-only collection.** `pipe.collect` only finds scopes sharing the same parent. Cross-level collection requires `pipe.expose` to push data up first.
+- **Routing kind transparency.** `pipe.to` and `pipe.expose` are terminal stages. `pipe.collect` is non-terminal -- transforms after it operate on the combined pool.
+- **`pipe.for` singularity.** At most one `pipe.for` per pipe per scope. Multiple is a hard error with policy name provenance.
+- **Empty pipes default to `[]`.** Consumers always receive a list (or a `pipe.for` result), never missing/null.
+- **Config thunk cycle avoidance.** Local thunks are marked and resolved in `evalModules`; cross-host thunks use pipe-data-free `hostConfigs`. Neither path creates a circular dependency with `assemblePipes`.
 
-Purely additive. No existing behavior changes. Unregistered keys continue to work as class modules (backwards compat). Declaring a key in `den.pipes` opts it into pipe semantics.
+---
 
-### From deleted trait system
+## 10. Key Files
 
-The pipe system replaces traits with:
-- No evaluation tiers (the pipeline collects uniformly; Nix laziness handles eval-time)
-- No DLQ (unregistered keys are class modules, always)
-- No `_den.traits` injection (delivery via `wrapClassModule` and `bind`)
-- No provide-to sub-pipelines (`pipe.collect` reads from already-walked state)
-- No `partialOk` / tier visibility validation (discriminators see what's available; class modules see everything)
+| File | Purpose |
+|---|---|
+| `modules/options.nix` | `den.quirks` option declaration, collision assertion, `name` injection |
+| `nix/lib/policy-effects.nix` | `pipe.*` effect constructors (`pipe.from`, `pipe.filter`, etc.) |
+| `nix/lib/aspects/fx/assemble-pipes.nix` | Post-pipeline pipe assembly engine (632 lines) |
+| `nix/lib/aspects/fx/key-classification.nix` | `classifyKeys` with `pipeKeys` category |
+| `nix/lib/aspects/fx/handlers/bind.nix` | Pipe arg detection and deferral in `bind` handler |
+| `nix/lib/aspects/fx/handlers/register-pipe-effect.nix` | Collects pipe effects into `scopedPipeEffects` |
+| `nix/lib/aspects/fx/class-module.nix` | Config thunk marker resolution in `wrapClassModule` |
+| `nix/lib/aspects/fx/wrap-classes.nix` | `applyPipeTargeting` for `pipe.to` delivery |
+| `nix/lib/aspects/fx/resolve.nix` | `assemblePipes` integration, `hostConfigs` construction, post-assembly drain |
+| `nix/lib/aspects/fx/policy/classify.nix` | Pipe effect classification and `__pipePolicyName` tagging |
 
-### Spec disposition
+### Test suites
 
-| Spec | Action |
-|------|--------|
-| `design/traits.md` | Superseded by this document |
-| `design/fleet-and-exports.md` | Cross-host case handled by `pipe.collect` + config-dependent thunks. `fleet`/`nodes` module arg remains a useful orthogonal convenience but is not required. |
-| `tbd/emission-pipeline.md` | Shared `emit-content` concept validated but unnecessary — pipes reuse `emit-class` collection. `wrapClassModule` decomposition deferred (function is cohesive at current size). |
+| File | Coverage |
+|---|---|
+| `templates/ci/modules/features/pipes.nix` | Declaration, classification, local consumption, list flattening, discriminator deferral, empty pipes |
+| `templates/ci/modules/features/pipe-policy.nix` | `pipe.filter`, `pipe.transform`, `pipe.fold`, `pipe.append`, `pipe.for`, combined stages, multi-policy merge, `pipe.to`, ref syntax |
+| `templates/ci/modules/features/pipe-scope.nix` | `pipe.expose`, `pipe.collect`, self-exclusion, entity-kind filtering, fleet collection, `pipe.withProvenance`, config thunks, mutual config dependencies |
+
+---
+
+## 11. Design Decisions
+
+- **Reuse `scopedClassImports`.** Pipe keys flow through `emit-class` into the existing scope-partitioned collection infrastructure. No separate collection bucket or emission handler.
+- **`den.quirks` not `den.pipes`.** The option is `den.quirks` (the data declaration); `pipe` is reserved for the policy builder API (`pipe.from`, `pipe.filter`, etc.). Quirk = data emitted by an aspect. Pipe = the policy-mediated channel.
+- **No schema validation.** Pipes do not validate quirk shape. Quirks are arbitrary data; consumers and policies transform as needed.
+- **Always a list.** Quirks are always collected as a list. No `list`/`map`/`single` collection strategies. `pipe.for` and `pipe.fold` handle reduction when needed.
+- **Two-path config thunk resolution.** Local thunks are marked and resolved inside `evalModules` to avoid circular deps. Cross-host thunks use pipe-data-free `hostConfigs` for eager resolution during assembly. This split eliminates the cycle `assemblePipes -> hostConfigs -> evalModules -> pipe data`.
+- **Bidirectional entity-kind filter on `pipe.collect`.** Predicate function args determine which entity kinds are accepted. Scopes with extra entity kinds beyond what the predicate requires are rejected. This prevents user scopes from leaking into host-level collection.
+- **Non-terminal `pipe.collect`.** Unlike `pipe.to` and `pipe.expose`, `pipe.collect` allows subsequent transform stages. This enables collect-then-filter-then-expose patterns.
+- **Provenance is opt-in.** Consumers see flat quirk values by default. `pipe.withProvenance` opts into `{ value, source }` wrapping when source context is needed.
+- **No `_den.traits` injection.** Pipe data is delivered via `wrapClassModule` pre-application and `bind` handlers, not through generated NixOS options.
+- **Static registration.** All pipes are declared at `den.quirks` before the pipeline starts. No dynamic `register-pipe` effect during the walk.
+
+---
+
+*Cross-references: [scope-partitioning.md](scope-partitioning.md) for scope mechanics and `scopeParent`; [policy-system.md](policy-system.md) for pipe effect dispatch and `scopedPipeEffects` collection.*
