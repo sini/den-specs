@@ -293,17 +293,25 @@ ctxFromHandlers helper in aspect.nix
 
 ## 5. Known Bugs from Specs
 
+*Updated 2026-05-07 against feat/fx-pipeline (753/753 tests).*
+
 | Bug | Location | Severity | Status |
 |---|---|---|---|
-| `builtins.seq (map ...) null` never fires traces — unregistered aspect class key warnings are silently swallowed | `nix/lib/aspects/fx/aspect.nix:842-845` | Low (was Medium) — DLQ now handles unregistered keys instead of relying on trace warnings | Partially mitigated by DLQ (2026-04-28); trace fix (`builtins.foldl'`) still not landed |
-| `modulesPath` dead destructure in `pipeline.nix:303` | `nix/lib/aspects/fx/pipeline.nix:303` | Low — trivial dead code | Open |
-| `emitNestedAspect` silently drops function-valued keys with no trace warning (`aspect.nix:800`) | `nix/lib/aspects/fx/aspect.nix:800` | Low-medium — function-valued nested keys coerced to `{}` without user feedback | Open |
-| `traitCollectorHandler` captures root `ctx` at construction time, not `state.currentCtx` — Tier 2 classification can misfire if trait-providing aspects have args satisfied only by transitions | `nix/lib/aspects/fx/handlers/trait.nix:113` | Low in practice (safe fallback to Tier 3 added in `07055169`) — but architectural limitation | Partially addressed; full fix (read `state.currentCtx`) not landed |
-| `provide-to.nix` handler comment documents stale "aspects declare `provide-to.${label}`" pattern — actual mechanism is sibling sub-pipeline trait capture | `nix/lib/aspects/fx/handlers/provide-to.nix` header | Low — misleading documentation only | Open |
-| `scope.run` limitation (deep handler bug): `scope.run` via `rotateInterpret` drops events in nested scope — den avoids it using `scope.provide`, but `rotateInterpret` path is not production-validated | `sini/nix-effects` | Low (not on production path) — `scope.stateful` effectively disabled | Mitigated by using `scope.provide` throughout |
-| `perHost-perUser.nix` `into` compat slot: `den.ctx.*.into` option exists in ctx-shim but is declared `raw` with no forwarding — users who wrote custom `den.ctx.host.into.my-stage` policies get silence, not an error or migration message | `modules/compat/ctx-shim.nix` | Medium — silent migration failure for `into` users | Open |
-| `ownerIdentity` stored but never read: `provides-compat.nix` writes `ownerIdentity = nodeIdentity` to registered compat policies, but `dispatchPolicyIncludesHandler` in `tree.nix:362-385` filters only by `functionArgs` — compat policies continue firing when source aspect is excluded | `nix/lib/aspects/fx/handlers/tree.nix:362-385` | Low-medium — excluded aspects leak compat include effects | Open |
-| Trait arg consumption via function signature broken: `test-enrichment-with-traits` in policy-context-enrichment tests explicitly notes that `{ greeting, ... }:` destructuring does not receive trait values — only trait *emission* coexists with enrichment, not trait *consumption* via function args | `templates/ci/modules/features/policy-context-enrichment.nix:362` | Low-medium — trait function args silently unfilled | Open (separate tracking) |
+| Unregistered class key warnings silently dropped — `classify.nix:19` merges unregistered keys into classKeys with no warning | `nix/lib/aspects/fx/key-classification.nix:19` | Low — unregistered keys still emit as classes, just no user feedback | **Open** (evolved from old `builtins.seq` bug; old code deleted, symptom persists in new location) |
+| Function-valued nested keys silently coerced to `{}` | `nix/lib/aspects/fx/handlers/compile-static.nix:32` | Low-medium — no trace warning on non-attrset branch | **Open** (moved from old `aspect.nix:800`) |
+| `ownerIdentity` stored but never read in policy registration | `nix/lib/aspects/fx/handlers/policy.nix:12` writes it; `nix/lib/aspects/fx/policy/dispatch.nix:43,49` only reads `.fn` | Low — dead field, no functional impact | **Open** (migrated from deleted `provides-compat.nix` / `tree.nix`) |
+
+### Resolved / No Longer Applicable
+
+| Bug | Resolution |
+|---|---|
+| `modulesPath` dead destructure in `pipeline.nix` | **Fixed** — `pipeline.nix` rewritten to 236 lines, `modulesPath` eliminated |
+| `traitCollectorHandler` captures stale root ctx | **Deleted** — traits system removed entirely |
+| `provide-to.nix` stale handler comment | **Deleted** — `provide-to.nix` removed |
+| `scope.run` deep handler bug | **Fixed** — `scope.run`/`scope.stateful` completely absent; `scope.provide` is the sole production path |
+| `den.ctx.*.into` compat slot silent failure | **Deleted** — `ctx-shim.nix` removed; `into` is now a normal structural key |
+| Trait arg consumption via `{ greeting, ... }:` broken | **Deleted** — traits system removed; pipe args (via `den.quirks`) replace this use case |
+| Four failing tests (den-as-lib, cybolic-routes, user-host-mutual-config ×2) | **Fixed** — all pass in 753/753 suite |
 
 ---
 
