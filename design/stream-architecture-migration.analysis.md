@@ -2,11 +2,9 @@
 
 ## Verdict
 
-not-implemented
+reference
 
-The spec is a forward-looking design document written 2026-05-07 (today). Zero stream primitives
-(ST, ctxD, scopeD, run, hostsT, usersT, mkEntityDriver) exist in the implementation. The current
-codebase is the exact "Current Model (Shared Pipeline)" the spec proposes to eliminate.
+This is an analysis document, not an implementation spec. It maps each current pipeline subsystem (forwards, policies, pipes, DI, dedup) to stream equivalents, establishing the feasibility of the stream approach. It informs the companion specs (den2-stream-rebuild, den2-incremental-delivery) but does not itself propose code changes.
 
 ## Delivery Target
 
