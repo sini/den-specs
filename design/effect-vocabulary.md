@@ -1,6 +1,6 @@
 # Effect Vocabulary Reference
 
-**Branch:** feat/fx-pipeline (713/713 tests)
+**Branch:** feat/fx-pipeline (753/753 tests)
 **Scope:** Complete catalog of pipeline effects, their payloads, and handler locations.
 
 ---
@@ -39,10 +39,11 @@ Forwards and conditionals bypass dedup/constraints. Only parametric and static g
 
 | Effect | Handler File | Payload | Resume |
 |--------|-------------|---------|--------|
-| `check-dedup` | `check-dedup.nix` | aspect | `{ isDuplicate }` |
+| `gate` | `gate.nix` | `{ aspect, identity, ctx }` | `{ blocked, result }` or `{ passed, owner? }` |
+| `check-dedup` | `check-dedup.nix` | aspect | `{ isDuplicate, dedupKey }` |
 | `check-constraint` | `constraint.nix` | `{ identity, aspect }` | action |
 
-Gating is handled inline in `compile-static` and `compile-parametric` via `gate-tag.nix`.
+`gate` is the composite gating effect used by `compile-static` and `compile-parametric` (via `gate-tag.nix`). It sequences dedup then constraint checks and resumes `{ blocked, result }` if either rejects the aspect, or `{ passed, owner? }` on clean pass-through. The `gate-tag` utility (not an effect) calls `gate` and tags `constraintOwner` onto the aspect before continuing.
 
 ## 3. Bind Subsystem
 
@@ -135,6 +136,7 @@ Single handler performs all scope entry:
 | `register-route` | `route.nix` | route spec | null |
 | `register-provide` | `provide.nix` | provide spec | null |
 | `register-instantiate` | `instantiate.nix` | instantiate spec | null |
+| `register-pipe-effect` | `register-pipe-effect.nix` | pipe effect spec | null |
 
 ## 8. Chain / Identity
 
@@ -142,8 +144,11 @@ Single handler performs all scope entry:
 |--------|-------------|---------|--------|
 | `chain-push` | `chain.nix` | `{ identity }` | null |
 | `chain-pop` | `chain.nix` | null | null |
-| `resolve-complete` | `chain.nix` | resolved aspect | null |
+| `resolve-complete` | `identity.nix` | resolved aspect | the aspect (pass-through) |
+| `get-path-set` | `identity.nix` | null | path set attrset |
 | `ctx-seen` | `ctx.nix` | `{ key, aspects, aspectValues }` | `{ isFirst, newAspectValues }` |
+
+`resolve-complete` is handled by `identity.collectPathsHandler`: it records the aspect into `state.pathSet` (for `hasAspect` queries) and resumes with the aspect unchanged. `get-path-set` reads that accumulated set back out. Both handlers live in `identity.nix`, not in the handlers/ directory.
 
 ## 9. Scope Primitives
 
@@ -157,40 +162,45 @@ Single handler performs all scope entry:
 ## File Map
 
 ```
-nix/lib/aspects/fx/handlers/
-├── resolve.nix              # resolve → compile delegation
-├── compile.nix              # shape router
-├── compile-forward.nix      # forward → route registration
-├── compile-conditional.nix  # guard → include/tombstone
-├── compile-parametric.nix   # bind → tag → re-resolve
-├── compile-static.nix       # classify → emit → children
-├── gate-tag.nix             # dedup + constraint gating
-├── bind.nix                 # scope probe + apply
-├── defer.nix                # stub + queue
-├── drain.nix                # partition satisfiable
-├── scope-widen.nix          # auto-drain trigger
-├── classify.nix             # key classification
-├── emit-classes.nix         # batch class emission
-├── class-collector.nix      # emit-class → scope-partitioned state
-├── resolve-children.nix     # policies + includes orchestration
-├── dispatch-policies.nix    # run + classify policies
-├── record-fired.nix         # record fired policy names
-├── emit-policy-effects.nix  # emit converged effects
-├── widen-context.nix        # update scope context
-├── push-scope.nix           # atomic scope entry
-├── restore-scope.nix        # scope exit
-├── propagate-routes.nix     # root route propagation
-├── resolve-schema-entity.nix # entity fan-out orchestration
-├── include.nix              # emit-include + include-unseen
-├── chain.nix                # chain-push/pop/resolve-complete
-├── constraint.nix           # register + check constraints
-├── check-dedup.nix          # dedup check
-├── ctx.nix                  # ctx-seen + constantHandler
-├── forward.nix              # forward tier classification
-├── policy.nix               # register-aspect-policy
-├── provide.nix              # register-provide
-├── route.nix                # register-route
-├── instantiate.nix          # register-instantiate
-├── state-util.nix           # scopedMerge helper
-└── default.nix              # handler composition
+nix/lib/aspects/fx/
+├── identity.nix             # resolve-complete + get-path-set handlers (collectPathsHandler, pathSetHandler)
+├── pipeline.nix             # resolve-entity handler + defaultHandlers composition + mkScopeId
+└── handlers/
+    ├── default.nix          # handler composition (merges all handler sets)
+    ├── resolve.nix          # resolve → compile delegation
+    ├── compile.nix          # shape router
+    ├── compile-forward.nix  # forward → route registration
+    ├── compile-conditional.nix  # guard → include/tombstone
+    ├── compile-parametric.nix   # bind → tag → re-resolve
+    ├── compile-static.nix       # classify → emit → children
+    ├── gate.nix             # composite dedup + constraint gate effect
+    ├── gate-tag.nix         # utility: calls gate, tags constraintOwner (not a handler set)
+    ├── bind.nix             # scope probe + apply
+    ├── defer.nix            # stub + queue
+    ├── drain.nix            # partition satisfiable
+    ├── scope-widen.nix      # auto-drain trigger
+    ├── classify.nix         # key classification
+    ├── emit-classes.nix     # batch class emission
+    ├── class-collector.nix  # emit-class → scope-partitioned state
+    ├── resolve-children.nix # policies + includes orchestration
+    ├── dispatch-policies.nix    # run + classify policies
+    ├── record-fired.nix     # record fired policy names
+    ├── emit-policy-effects.nix  # emit converged effects
+    ├── widen-context.nix    # update scope context
+    ├── push-scope.nix       # atomic scope entry
+    ├── restore-scope.nix    # scope exit
+    ├── propagate-routes.nix # root route propagation
+    ├── resolve-schema-entity.nix # entity fan-out orchestration
+    ├── include.nix          # emit-include + include-unseen
+    ├── chain.nix            # chain-push + chain-pop
+    ├── constraint.nix       # register-constraint + check-constraint
+    ├── check-dedup.nix      # dedup check
+    ├── ctx.nix              # ctx-seen + constantHandler
+    ├── forward.nix          # buildForwardAspect utility (no effects — used by compile-forward)
+    ├── policy.nix           # register-aspect-policy
+    ├── provide.nix          # register-provide
+    ├── route.nix            # register-route
+    ├── instantiate.nix      # register-instantiate
+    ├── register-pipe-effect.nix # register-pipe-effect
+    └── state-util.nix       # scopedMerge / scopedAppend helpers
 ```
