@@ -1,14 +1,10 @@
-# Den Policy System — Design Spec (feat/fx-pipeline, 713/713)
+# Policy System
 
-**Date:** 2026-05-04
-**Branch:** feat/fx-pipeline
-**Source of truth:** Code in nix/lib/policy-effects.nix, nix/lib/aspects/fx/policy-dispatch.nix, nix/lib/aspects/fx/aspect.nix, nix/lib/aspects/fx/include-emit.nix, nix/lib/aspects/fx/handlers/tree.nix, modules/policies/core.nix, modules/policies/flake.nix
+Policies are the central mechanism for topology construction, context enrichment, and content routing in Den. A policy is a plain Nix function that receives entity context and returns a list of typed effects. The function's parameter signature determines when it fires: the pipeline inspects `builtins.functionArgs` and only calls the policy when every required argument is present in the resolve context. This signature-based dispatch, combined with fixed-point enrichment iteration, allows policies to express complex conditional topology without imperative control flow.
 
----
+## Policy Shape
 
-## 1. Policy Shape
-
-A policy is a plain Nix function from context to a list of typed effects:
+A policy is a function from context attrset to a list of effects:
 
 ```nix
 den.policies.<name> = { host, user, ... }: [
@@ -17,59 +13,51 @@ den.policies.<name> = { host, user, ... }: [
 ];
 ```
 
-Policies carry no metadata — no `from`, `to`, `__functor`, `_core`, or `isolateFanOut` fields. The function's parameter signature determines when it fires: the pipeline matches required parameter names against available context keys. A policy fires when every required argument (non-default parameter) is present in the resolve context. Optional arguments (those with defaults) do not gate firing.
+The NixOS module system merges policy definitions through `policyRegistryType` (`nix/lib/aspects/policy-type.nix`), a `lazyAttrsOf policyFnType`. The merge coerces each definition into a `{ __isPolicy, name, fn }` record:
 
-The `resolveArgsSatisfied` function (synthesize-policies.nix) implements this check:
+- Raw functions become `{ __isPolicy = true; name = "<attr-name>"; fn = <the-function>; }`.
+- Attrsets with `__isPolicy = true` are passed through, with `name` overwritten to match the attribute name.
+- Anything else throws.
 
-```nix
-resolveArgsSatisfied = policy: ctx:
-  let
-    fargs = lib.functionArgs policy;
-    requiredArgs = builtins.filter (k: !fargs.${k}) (builtins.attrNames fargs);
-  in
-  builtins.all (k: ctx ? ${k}) requiredArgs;
-```
+A policy may return a single effect or a list; dispatch normalizes both to a list. Returning `[]` is valid and means the policy produced no effects for the current context.
 
-A policy taking `_:` or `{ ... }:` fires unconditionally. A policy taking `{ host, ... }:` fires only when `host` is in context.
+## Effect Types
 
-A policy may return a single effect or a list of effects. The dispatch normalizes both to a list.
+All constructors live in `nix/lib/policy-effects.nix` and are exposed as `den.lib.policy.*`. Each returns an attrset with a `__policyEffect` string discriminator. The dispatch validates that every returned effect has a known `__policyEffect` value.
 
----
+| Constructor | `__policyEffect` | Purpose |
+|---|---|---|
+| `policy.resolve bindings` | `"resolve"` | Isolated fan-out / enrichment |
+| `policy.resolve.shared bindings` | `"resolve"` | Shared fan-out (`__shared = true`) |
+| `policy.resolve.to kind bindings` | `"resolve"` | Explicit target entity kind |
+| `policy.resolve.shared.to kind bindings` | `"resolve"` | Shared + explicit target |
+| `policy.resolve.withIncludes includes bindings` | `"resolve"` | Per-resolve scoped includes |
+| `policy.resolve.to.withIncludes kind includes bindings` | `"resolve"` | Target + per-resolve includes |
+| `policy.resolve.shared.withIncludes includes bindings` | `"resolve"` | Shared + per-resolve includes |
+| `policy.include aspect` | `"include"` | Inject aspect into current scope |
+| `policy.exclude aspect` | `"exclude"` | Remove aspect from subtree |
+| `policy.route spec` | `"route"` | Route class content to a target class |
+| `policy.instantiate spec` | `"instantiate"` | Request post-pipeline instantiation |
+| `policy.provide spec` | `"provide"` | Deliver module directly into a class |
+| `policy.pipe.from name stages` | `"pipe"` | Attach transform stages to a pipe |
 
-## 2. Effect Types
+### resolve
 
-All effect constructors live in `nix/lib/policy-effects.nix` and are exposed as `den.lib.policy.*`. Each returns a tagged attrset with a `__policyEffect` string discriminator.
+Creates a new context scope. Classification against `schemaEntityKinds` (entity kinds where `isEntity = true` in `den.schema`) determines the effect's role:
 
-### 2.1 resolve
+- **Schema resolve:** All binding keys match schema entity kinds, or `__targetKind` is set. Creates a child entity via `resolve-schema-entity`. See [entity-resolution.md](entity-resolution.md).
+- **Enrichment resolve:** No binding keys match schema entity kinds. Merges bindings into the current scope's context. No child entity is created; subsequent policy iterations and class modules see the new keys.
+- **Mixed resolve:** Some keys are schema, some are not. The resolve is split: schema keys create a child entity, non-schema keys enrich the current context.
 
-Creates a new context scope (fan-out). Each resolve creates a parallel sibling branch with new bindings merged into the parent context.
+`policy.resolve {}` (empty bindings) is filtered out as a no-op.
 
-```nix
-policy.resolve { user = tux; }
-# => { __policyEffect = "resolve"; __shared = false; value = { user = tux; }; includes = []; }
-```
+`resolve.shared` sets `__shared = true`, causing sibling scopes to share context rather than getting isolated partitions. Used by `host-to-users` so all users share the host scope.
 
-**Variants:**
+`resolve.to kind` sets `__targetKind`, overriding the default kind derivation from binding keys. Used for non-schema routing (e.g., `resolve.to "flake-system" { inherit system; }`).
 
-| Constructor | Semantics |
-|---|---|
-| `policy.resolve bindings` | Isolated fan-out. Child scope gets its own scope partition. |
-| `policy.resolve.shared bindings` | Shared fan-out. `__shared = true`. Multiple siblings share context rather than getting isolated partitions. Used by `host-to-users` so users share the host scope. |
-| `policy.resolve.to kind bindings` | Explicit target entity kind. `__targetKind = kind` overrides the default derivation from binding keys. Used for non-schema routing (e.g., `resolve.to "flake-system"`). |
-| `policy.resolve.shared.to kind bindings` | Shared + explicit target. |
-| `policy.resolve.withIncludes includes bindings` | Per-resolve scoped includes. The `includes` list is carried on the resolve effect and emitted inside the child scope's `scope.provide` frame. |
-| `policy.resolve.to.withIncludes kind includes bindings` | Explicit target + per-resolve includes. |
-| `policy.resolve.shared.withIncludes includes bindings` | Shared + per-resolve includes. |
+`resolve.withIncludes includes bindings` carries an `includes` list on the resolve effect. These aspects are emitted inside the child scope's resolution.
 
-**Resolve classification:** The pipeline classifies each resolve effect's binding keys against `schemaEntityKinds` (entity kinds from `den.schema` where `isEntity = true`):
-
-- **Schema resolve:** All keys match schema entity kinds, or `__targetKind` is set. Creates a child entity via `resolve-schema-entity`.
-- **Enrichment resolve:** No keys match schema entity kinds. Enriches the current entity's context — no child entity created. The bindings become available to subsequent policy dispatch iterations and to class modules via `wrapClassModule`.
-- **Mixed resolve:** Some keys match, others don't. Split: schema keys create child entities, non-schema keys enrich current context.
-
-`policy.resolve {}` (empty bindings) is a no-op — filtered out before processing.
-
-### 2.2 include
+### include
 
 Injects an aspect into the current resolution context:
 
@@ -78,22 +66,22 @@ policy.include den.aspects.sudo
 # => { __policyEffect = "include"; value = <aspect>; }
 ```
 
-Accepts aspect references and inline attrsets (coerced to anonymous aspects). Emitted via `emit-include` with source policy name tagging for identity dedup — this prevents `emit-class` LOC dedup from collapsing distinct policy outputs. When the include value has no `name` attribute, it is tagged with `name = "<policy:${policyName}>"`.
+Accepts aspect references and inline attrsets (coerced to anonymous aspects). When the include value has no `name` attribute, it is tagged with `name = "<policy:${policyName}>"` to prevent identity dedup collisions across distinct policy outputs. Multiple includes from the same policy get an `[${idx}]` suffix.
 
-### 2.3 exclude
+### exclude
 
-Removes/gates an aspect from the current resolution subtree:
+Removes an aspect from the current resolution subtree:
 
 ```nix
 policy.exclude den.aspects.desktop
 # => { __policyEffect = "exclude"; value = <aspect>; }
 ```
 
-Emitted via `register-constraint` with `type = "exclude"`, `scope = "subtree"`. The identity is derived from the aspect's path. Excludes propagate into child scopes.
+Emitted via `register-constraint` with `type = "exclude"`, `scope = "subtree"`. The identity is derived from the aspect's path key. Excludes propagate into child scopes. See [constraint-system.md](constraint-system.md).
 
-### 2.4 route
+### route
 
-Routes class content from one scope partition into a target class. Replaces `den.provides.forward` for the common (route-eligible) case:
+Routes class content from one scope partition into a target class:
 
 ```nix
 policy.route {
@@ -102,304 +90,291 @@ policy.route {
   path = [ "flake" "packages" system ];
   adaptArgs = _: { pkgs = inputs.nixpkgs.legacyPackages.${system}; };
 }
-# => { __policyEffect = "route"; value = <spec>; }
 ```
 
 Emitted via `register-route`. The route spec is processed post-pipeline by `applyForwardSpecs` / `wrapRouteModules`.
 
-### 2.5 instantiate
+### instantiate
 
 Requests post-pipeline instantiation of an entity's class content. The entity carries `instantiate`, `intoAttr`, and `mainModule` metadata:
 
 ```nix
 policy.instantiate hostEntity
-# => { __policyEffect = "instantiate"; value = <entity-spec>; }
 ```
 
 Emitted via `register-instantiate`. Used by flake policies to wire OS and HM outputs (`to-os-outputs`, `to-hm-outputs`).
 
-### 2.6 provide
+### provide
 
-Delivers a new module directly into a target class, bypassing the aspect tree walk:
+Delivers a module directly into a target class, bypassing the aspect tree walk:
 
 ```nix
 policy.provide { class = "nixos"; module = myModule; }
-# => { __policyEffect = "provide"; value = { class = "nixos"; module = myModule; }; }
 ```
 
-Emitted via `register-provide`. Created to fix duplicate emissions from the provides-compat shim — `policy.include` walks content through the tree (creating duplicates when content matches routes), while `policy.provide` bypasses the tree entirely.
+Emitted via `register-provide`. Unlike `policy.include` (which walks content through the tree and can create duplicates when content matches routes), `policy.provide` bypasses the tree entirely.
 
-### 2.7 pipelineOnly
+### pipe.from
 
-Not a policy effect — a value wrapper. Tags a value with `collisionPolicy = "class-wins"` so that when it reaches a class module that also receives the same arg from the module system (e.g., NixOS provides `lib`), the pipeline value wins silently:
+Attaches transform stages to a named pipe. See [pipes-and-quirks.md](pipes-and-quirks.md) for the pipe system.
 
 ```nix
-policy.pipelineOnly value
-# For attrsets: value // { collisionPolicy = "class-wins"; }
-# For non-attrsets: { __functor = _: value; collisionPolicy = "class-wins"; }
+policy.pipe.from "my-pipe" [
+  (policy.pipe.filter (item: item.enable or false))
+  (policy.pipe.transform (item: item // { processed = true; }))
+]
 ```
 
-Used by `den.provides.flake-scope` to inject `lib`, `inputs`, `den` into the pipeline without colliding with NixOS's own `lib`.
+Available pipe sub-stage constructors:
 
----
-
-## 3. Dispatch
-
-### 3.1 Entry Point: installPolicies
-
-`installPolicies` (policy-dispatch.nix, invoked from aspect.nix:resolveChildren) is the entry point. It fires when an aspect has `__entityKind` set — i.e., the aspect represents a schema entity boundary.
-
-**Dedup:** Each entity scope dispatches policies at most once. The dispatch is keyed by `"${entityKind}@${currentScope}"` and tracked in `state.dispatchedPolicies`. If already dispatched, returns immediately.
-
-**Context assembly:** The resolve context is built from three sources, merged with later sources taking precedence:
-1. `state.scopeContexts.${currentScope}` — scope context from prior enrichment
-2. `ctxFromHandlers(aspect.__scopeHandlers)` — handler-derived context from the aspect's lexical scope
-3. `{ __entityKind = entityKind }` — entity kind tag injected for policies that discriminate on it
-
-### 3.2 Policy Sources
-
-Three policy registries are merged for dispatch:
-
-| Registry | Source | Scope |
+| Constructor | `__pipeStage` | Purpose |
 |---|---|---|
-| **Global** | `den.policies` | Fires at every entity scope where signature matches |
-| **Schema-scoped** | `den.schema.${entityKind}.policies` | Fires only at entities of matching kind |
-| **Aspect-included** | `state.scopedAspectPolicies` (accumulated via `register-aspect-policy`) | Fires when the aspect containing the policy has been included in the tree walk |
+| `pipe.filter pred` | `"filter"` | Filter items by predicate |
+| `pipe.transform fn` | `"transform"` | Transform each item |
+| `pipe.fold fn init` | `"fold"` | Fold items into accumulator |
+| `pipe.append value` | `"append"` | Append a static value |
+| `pipe.for fn` | `"for"` | Map items with a function |
+| `pipe.withProvenance` | `"withProvenance"` | Attach provenance metadata |
+| `pipe.to aspects` | `"to"` | Route pipe output to aspects |
+| `pipe.expose` | `"expose"` | Expose pipe as flake output |
+| `pipe.collect pred` | `"collect"` | Collect items matching predicate |
 
-Global and schema-scoped policies are merged into `allDirectPolicies` (schema policies shadow global policies with the same name). Aspect policies are dispatched separately via `dispatchAspect`.
+## Dispatch
 
-### 3.3 Dispatch Mechanics
+### Entry Point
 
-`dispatchDirect` iterates `allDirectPolicies` — for each policy, checks `resolveArgsSatisfied` and that the policy name hasn't already been fired. If satisfied, calls the policy with the resolve context and collects its effects.
+`installPolicies` (`nix/lib/aspects/fx/policy/default.nix`) fires when an aspect has `__entityKind` set (i.e., the aspect represents a schema entity boundary).
 
-`dispatchAspect` does the same for aspect policies, checking `lib.functionArgs` of the `.fn` field rather than the policy itself (aspect policies are stored as `{ fn, ownerIdentity }` records).
+**Dedup:** Each entity scope dispatches policies at most once. The dispatch is keyed by `"${entityKind}@${currentScope}"` and tracked in `state.dispatchedPolicies`. If already dispatched, returns immediately via `fx.pure []`.
 
-Results from both dispatchers are concatenated, then classified by `classifyPolicyResult` into per-effect-type buckets:
+**Context assembly:** The resolve context is built from two sources, merged with later sources taking precedence:
 
-- `schemaEffects` — resolve effects with schema keys or explicit target kinds
-- `mergedEnrichment` — all enrichment keys merged into one attrset
-- `includeEffects`, `excludeEffects`, `routeEffects`, `instantiateEffects`, `provideEffects`
+1. `state.scopeContexts.${currentScope}` -- scope context from prior enrichment
+2. `ctxFromHandlers(aspect.__scopeHandlers)` -- handler-derived context from the aspect's lexical scope
 
-### 3.4 Cross-Provider Tagging
+The merged context is augmented with `__entityKind = entityKind` before dispatch.
 
-When a policy produces both schema resolve effects (with `__targetKind`) and include effects, it is tagged `isCrossProvider = true`. In this case, the include effects are attached to the schema effects as `__policyIncludes` rather than emitted independently. This allows cross-provider patterns where a policy routes content to a target entity and includes aspects that should be walked within that target's scope.
+### resolveArgsSatisfied
 
-Non-cross-provider include effects are emitted normally, tagged with `__sourcePolicyName` for identity tracking.
+`resolveArgsSatisfied` (`nix/lib/synthesize-policies.nix`) checks whether a policy's required arguments are present in context:
 
----
+```nix
+resolveArgsSatisfied = policy: ctx:
+  if !lib.isFunction policy then false
+  else
+    let
+      fargs = lib.functionArgs policy;
+      requiredArgs = builtins.filter (k: !fargs.${k}) (builtins.attrNames fargs);
+    in
+    builtins.all (k: ctx ? ${k}) requiredArgs;
+```
 
-## 4. Enrichment: Fixed-Point Iteration
+- `_:` or `{ ... }:` fires unconditionally (no required args).
+- `{ host, ... }:` fires only when `host` is in context.
+- `{ host, isNixos ? false, ... }:` fires when `host` is in context; `isNixos` is optional.
 
-The `iterate` function implements enrichment-to-fixpoint. Starting from the initial resolve context:
+### Policy Sources
 
-1. **Dispatch** all policies against current context
-2. **Collect** enrichment keys (non-schema resolve bindings)
+Policies enter the dispatch system from two sources:
+
+| Source | How activated | Scope |
+|---|---|---|
+| **Schema/default includes** | Policy referenced in `den.schema.*.includes` or `den.default.includes` | Dispatched at entity boundaries matching the schema kind |
+| **Aspect-scoped** | Policy declared in `aspect.policies.*`, registered via `register-aspect-policy` during tree walk | Dispatched at the scope where the owning aspect was included |
+
+`den.policies` is a named registry only — it does NOT auto-dispatch. Policies must be explicitly referenced from an activation site.
+
+The `dispatch-policies` handler (`nix/lib/aspects/fx/handlers/dispatch-policies.nix`) receives both sets, filters out any policies excluded by the constraint registry, then calls `mkDispatch` which runs `dispatchAspect` against the combined set.
+
+For each policy, `dispatchAspect` checks `resolveArgsSatisfied` on the `.fn` field and that the policy name hasn't already been fired. Satisfied policies are called with the resolve context and their effects are validated (must have valid `__policyEffect` tags) and classified.
+
+### Enrichment Convergence
+
+The `iterate` function (`nix/lib/aspects/fx/policy/iterate.nix`) implements enrichment-to-fixpoint:
+
+1. **Dispatch** all policies against current context (via `dispatch-policies` effect).
+2. **Collect** enrichment keys (non-schema resolve bindings).
 3. If **new enrichment keys** appeared (keys not in the accumulated enrichment):
-   - Merge new enrichment into accumulated context
-   - Install enrichment as scoped handlers via `scope.provide(constantHandler(combinedEnrichment))`
-   - Update `state.scopeContexts` for the current scope
-   - **Drain deferred includes** — parametric aspects that were deferred because their required args weren't available may now resolve with the new enrichment keys
-   - **Re-dispatch** (go to step 1 with widened context)
-4. If **no new enrichment keys** — enrichment is stable. Emit all accumulated effects.
+   - Merge new enrichment into accumulated context.
+   - Install enrichment as scoped handlers via `enterScope(constantHandler(combinedEnrichment))`.
+   - Send `widen-context` effect to update scope state.
+   - **Re-dispatch** (go to step 1 with widened context, increment iteration counter).
+4. If **no new enrichment keys** -- enrichment is stable. Record fired policies and emit all accumulated effects via `emit-policy-effects`.
 
-**Termination:** Iteration is capped at `maxPolicyIterations = 10`. Exceeding this throws an error indicating a likely enrichment cycle.
+**Termination:** Iteration is capped at `maxPolicyIterations = 10`. Exceeding this throws an error naming the fired policies and accumulated enrichment keys.
 
-**Deferred drain:** After enrichment widens context, `drainEnrichmentDeferred` sends a `drain-deferred` effect. Satisfiable deferred aspects are retrieved, tagged with the enriched context's scope handlers, and resolved via `aspectToEffect`. This allows parametric aspects like `{ isNixos, ... }: { ... }` to resolve once `isNixos` becomes available through enrichment.
+**Key-monotonic invariant:** Enrichment convergence checks new keys only. Value changes to existing keys do not trigger re-dispatch. This guarantees termination as long as the total number of enrichment keys is finite.
 
-**Commutativity:** Enrichment is downward-flowing only. A child scope's enrichment does not affect parent or sibling scopes. Multiple enrichment resolves from different policies merge additively — later values shadow earlier ones for the same key. Merge order follows dispatch order (global before schema before aspect), but the result is deterministic per-evaluation.
+**Commutativity:** Enrichment flows downward only. A child scope's enrichment does not affect parent or sibling scopes. Multiple enrichment resolves merge additively; later values shadow earlier ones for the same key.
 
----
+## Effect Classification
 
-## 5. Aspect-Included Policies
+`classifyPolicyResult` (`nix/lib/aspects/fx/policy/classify.nix`) sorts each policy's effects into buckets:
 
-Aspects can declare policies in their `.policies` attribute:
+| Bucket | Contents |
+|---|---|
+| `schemaEffects` | Resolve effects with schema keys or explicit `__targetKind` |
+| `mergedEnrichment` | All non-schema resolve bindings merged into one attrset |
+| `includeEffects` | `__policyEffect = "include"` effects |
+| `excludeEffects` | `__policyEffect = "exclude"` effects |
+| `routeEffects` | `__policyEffect = "route"` effects |
+| `instantiateEffects` | `__policyEffect = "instantiate"` effects |
+| `provideEffects` | `__policyEffect = "provide"` effects |
+| `pipeEffects` | `__policyEffect = "pipe"` effects |
+
+**Cross-provider tagging:** When a policy produces both schema resolve effects (with `__targetKind`) and include effects, it is tagged `isCrossProvider = true`. Include effects are attached to the schema effects as `__policyIncludes` rather than emitted independently. This enables patterns where a policy routes content to a target entity and includes aspects that should be walked within that target's scope.
+
+**Effect emission order** (after enrichment stabilizes):
+
+1. Excludes via `register-constraint`
+2. Routes, instantiates, provides via their respective handlers
+3. Pipe effects via `register-pipe-effect`
+4. If schema resolves exist: `processSchemaResolves` handles entity creation; cross-provider includes go with schema resolves, independent includes are emitted separately
+5. If no schema resolves: all includes emitted via `emit-include`
+
+## Scoping
+
+Policies are registered at three sites with different activation semantics:
+
+### den.policies (Named Registry)
+
+```nix
+den.policies.my-policy = { host, ... }: [ ... ];
+```
+
+`den.policies` is a typed attrset providing a named namespace for policy functions. Entries are coerced to `{ __isPolicy, name, fn }` records via `policyRegistryType`. **Declaring a policy here does NOT activate it.** Policies only fire when explicitly referenced from an activation site (see below).
+
+### Activation: den.schema.*.includes / den.default.includes
+
+```nix
+den.schema.host.includes = [ den.policies.host-to-users ];
+den.schema.flake-system.includes = [ den.policies.to-os-outputs ];
+den.default.includes = [ den.policies.host-guards ];
+```
+
+Schema and default includes are the primary activation paths. Placing a policy reference in `den.schema.*.includes` causes it to be dispatched when entities of that kind are resolved. `den.default.includes` activates a policy for all entity scopes.
+
+### aspect.policies (Aspect-scoped)
 
 ```nix
 den.aspects.myBattery = {
   policies.deliver-niri = { host, user, ... }: [ ... ];
-  # ...aspect content...
 };
 ```
 
-### 5.1 Registration
+Aspects can declare policies in their `.policies` attribute. During the tree walk, `emitAspectPolicies` registers each entry via `register-aspect-policy` with name `"${aspectName}/${policyName}"`, the policy function, and the owning aspect's identity. These are stored in `state.scopedAspectPolicies` keyed by scope and in `state.flatAspectPolicies` for global access.
 
-During the tree walk, when `resolveChildren` processes an aspect, it calls `emitAspectPolicies` (include-emit.nix). For each entry in `aspect.policies`, a `register-aspect-policy` effect is sent with:
-- `name`: `"${aspectName}/${policyName}"` — scoped by the owning aspect
-- `fn`: the policy function
-- `ownerIdentity`: the aspect's identity path key
+Aspect policies are scope-local: they fire at the scope where their owning aspect was included. A **late dispatch pass** corrects ordering dependencies when fan-out creates multiple siblings -- aspect policies registered by later siblings are re-dispatched against earlier siblings that may not have seen them.
 
-### 5.2 Handler
+## Combinators
 
-The `registerAspectPolicyHandler` (tree.nix) stores aspect policies in `state.scopedAspectPolicies`, keyed by scope:
+### policy.for
+
+Wraps a policy (or list of policies) to fire only for a specific entity, using `id_hash` for robust identity matching:
 
 ```nix
-state.scopedAspectPolicies.${currentScope}.${name} = { fn, ownerIdentity };
+den.policies.igloo-only = policy.for igloo (
+  { host, ... }: [ (policy.include den.aspects.gaming) ]
+);
 ```
 
-Policies from all scopes are merged (via `foldl'` over `builtins.attrValues`) when `installPolicies` reads aspect policies. This means an aspect policy registered at any scope is visible to all subsequent entity dispatches.
+The wrapper checks `ctx.${ctx.__entityKind}.id_hash == entity.id_hash`. Returns `[]` on mismatch. Preserves the inner policy's `name` and `__isPolicy` tag. Raw functions are auto-wrapped with `name = "<inline>"`.
 
-### 5.3 Provides-Compat Registration
+### policy.when
 
-The `provides-compat.nix` handler also uses `register-aspect-policy` to register compatibility policies for `provides.to-hosts`, `provides.to-users`, and named target patterns. These are registered with names like `"${aspectName}/compat:${key}"`.
-
-### 5.4 Late Dispatch Pass
-
-When `installPolicies` processes fan-out (multiple sibling schema resolves), aspect policies registered by later siblings may not have been visible when earlier siblings were dispatched. The `lateDispatchPass` corrects this:
-
-1. After all sibling resolves complete, iterate over sibling metadata
-2. For each sibling, find aspect policies not yet fired at that scope
-3. Dispatch those late policies against the sibling's context
-4. Emit include, route, instantiate, provide, and exclude effects within the sibling's scope (using `scope.provide` with the sibling's context handlers)
-
-Schema effects from late dispatch are intentionally NOT processed — they would cause duplicate module emissions with different identities.
-
----
-
-## 6. Schema-Scoped Policies
-
-`den.schema.${kind}.policies` provides entity-kind-scoped policy registration. These policies fire only when `installPolicies` runs at an entity of the matching kind.
-
-### 6.1 Built-in Schema Policies
-
-**modules/policies/core.nix:**
+Wraps a policy (or list of policies) to fire only when a predicate returns true:
 
 ```nix
-den.schema.host.policies.host-to-users = { host, ... }:
+den.policies.linux-only = policy.when (ctx: ctx.isNixos or false) (
+  { host, ... }: [ (policy.include den.aspects.linux-desktop) ]
+);
+```
+
+Returns `[]` when the predicate returns false. Preserves `name` and `__isPolicy`. Composes with `policy.for`:
+
+```nix
+policy.when pred (policy.for entity myPolicy)
+```
+
+Both combinators accept either a single policy or a list of policies. When given a list, each element is individually wrapped.
+
+## pipelineOnly
+
+Not an effect -- a value wrapper. Tags a value with `collisionPolicy = "class-wins"` so that when the value reaches a class module that also receives the same argument from the module system (e.g., NixOS provides `lib`), the pipeline value wins silently:
+
+```nix
+policy.pipelineOnly value
+```
+
+For attrsets: `value // { collisionPolicy = "class-wins"; }`. For functions: `{ __functor = _: value; collisionPolicy = "class-wins"; }`. Asserts the input is a function or attrset.
+
+Used by `den.provides.flake-scope` to inject `lib`, `inputs`, `den` into the pipeline without colliding with NixOS's own `lib`.
+
+## Built-in Policies
+
+### core.nix
+
+**`host-to-users`** -- the core traversal policy. Registered globally and activated via `den.schema.host.includes`:
+
+```nix
+den.policies.host-to-users = { host, ... }:
   map (user: resolve.shared { inherit user; }) (lib.attrValues host.users);
+
+den.schema.host.includes = [ den.policies.host-to-users ];
 ```
 
-The core traversal policy. When resolving a host entity, it fans out to each user with `resolve.shared` — users share the host scope rather than getting isolated partitions.
+When resolving a host entity, fans out to each user with `resolve.shared` so users share the host scope.
 
-**modules/policies/flake.nix:**
+### flake.nix
 
-Schema-scoped policies for flake output wiring:
+Flake output wiring policies, all activated via schema includes:
 
-| Policy | Schema | Effect |
+| Policy | Activated at | Effect |
 |---|---|---|
-| `to-systems` | `den.schema.flake` | Fan-out per system via `resolve.to "flake-system"` |
-| `to-os-outputs` | `den.schema.flake-system` | `policy.instantiate` for each host with `intoAttr` |
-| `to-hm-outputs` | `den.schema.flake-system` | `policy.instantiate` for each home with `intoAttr` |
-| `to-${output}` | `den.schema.flake-system` | `policy.route` from output class into flake at `["flake" output system]` |
+| `to-systems` | `den.schema.flake.includes` | Fan-out per system via `resolve.to "flake-system"` |
+| `to-os-outputs` | `den.schema.flake-system.includes` | `resolve.to "host"` + `policy.instantiate` for each host with `intoAttr` |
+| `to-hm-outputs` | `den.schema.flake-system.includes` | `resolve.to "home"` + `policy.instantiate` for each home with `intoAttr` |
+| `to-packages` | `den.schema.flake-system.includes` | `policy.route` from packages class into flake at `["flake" "packages" system]` |
+| `to-apps` | `den.schema.flake-system.includes` | Same pattern for apps |
+| `to-checks` | `den.schema.flake-system.includes` | Same pattern for checks |
+| `to-devShells` | `den.schema.flake-system.includes` | Same pattern for devShells |
+| `to-legacyPackages` | `den.schema.flake-system.includes` | Same pattern for legacyPackages |
 
-The `to-${output}` policies are generated for system outputs (packages, apps, checks, devShells, legacyPackages) and conditionally fire based on whether the flake output option exists.
+The `to-${output}` policies conditionally fire based on whether the flake output option exists (`has-flake-output`). Each uses `policy.route` with `adaptArgs` to inject `pkgs` from `nixpkgs.legacyPackages.${system}`.
 
-### 6.2 Merge with Global
+flake.nix also registers system output names (`packages`, `apps`, `checks`, `devShells`, `legacyPackages`) as classes via `den.classes`.
 
-In `installPolicies`, schema policies are merged after global policies (`globalPolicies // schemaPolicies`). Schema policies shadow global policies with the same name.
+## Invariants
 
----
+1. **Policies are pure functions.** A policy receives context and returns effects. No side effects, no state mutation, no dynamic registration within a policy body.
 
-## 7. Effect Emission
+2. **Signature-based dispatch.** Firing is determined solely by `builtins.functionArgs` against the resolve context. No explicit enable/disable flags.
 
-After enrichment stabilizes, `emitFinalEffects` processes accumulated effects in order:
+3. **Enrichment converges.** The key-monotonic invariant (only new keys trigger re-dispatch) plus the `maxPolicyIterations = 10` cap guarantee termination. Cycles throw with diagnostic information.
 
-1. **Excludes** — `policyEmitExcludes` sends `register-constraint` for each exclude effect
-2. **Routes, instantiates, provides** — `policyEmitEffects` sends `register-route`, `register-instantiate`, `register-provide` for each respective effect
-3. **Schema resolves** — if present, `processSchemaResolves` handles entity creation via `resolve-schema-entity`
-4. **Includes** (only if no schema resolves) — `policyEmitIncludes` sends `emit-include` for each include effect
+4. **No duplicate dispatch.** Each `"${entityKind}@${scope}"` combination dispatches at most once, tracked in `state.dispatchedPolicies`.
 
-When schema resolves exist, include effects are folded into the resolve processing (their aspect values are passed as `includeAspects` to `processSingleResolve`), not emitted independently.
+5. **Effect validation.** Every effect returned by a policy must have a valid `__policyEffect` tag from the set `{resolve, include, exclude, route, instantiate, provide, pipe}`. Invalid effects throw with the policy name and index.
 
-### 7.1 Schema Resolve Processing
+6. **Fired tracking.** Policies that produce effects are tracked per-scope in `state.firedPolicyNames` and per-iteration in the `firedPolicies` accumulator. A policy fires at most once per dispatch key.
 
-`processSingleResolve` handles each schema resolve effect:
+7. **Late dispatch correction.** Fan-out siblings get a late dispatch pass to ensure aspect policies registered by later siblings are visible to earlier ones. Schema effects from late dispatch are intentionally not processed to prevent duplicate entity creation.
 
-1. Determine `targetKind` — from `__targetKind` if set, otherwise from the first schema key in bindings
-2. Build `scopedCtx` by merging enriched context with resolve bindings
-3. Compute `ctxNames` via `mkScopeId(scopedCtx)` — the scope identifier
-4. Compute `ctxKey` — `"${targetKind}/{${ctxNames}}"` for fan-out, or just `targetKind` for single resolve
-5. Resolve entity class from bindings if available
-6. Send `ctx-seen` effect to check dedup — returns `{ isFirst, newAspectValues }`
-7. If first visit: send `resolve-schema-entity` to walk the entity tree within the child scope
-8. If revisit with new aspects: emit supplemental includes into the existing scope
-9. If revisit with no new aspects: no-op
+## Key Files
 
----
-
-## 8. Fired Policy Tracking
-
-Fired policy names are tracked at two granularities:
-
-1. **Per-iteration within `iterate`:** `firedPolicies` list prevents re-firing a policy within the same enrichment loop. Policies that produce effects are added to this list.
-
-2. **Per-scope in pipeline state:** `state.firedPolicyNames.${dispatchKey}` (where `dispatchKey = "${entityKind}@${scopeId}"`) records all policies fired at each scope. This is read by `lateDispatchPass` to avoid re-firing policies during cross-sibling late dispatch.
-
----
-
-## 9. Future Direction: Policy Scoping Redesign
-
-(From consolidated spec Section 9 — not yet implemented.)
-
-### 9.1 Problem
-
-Policy scoping is implicit and inconsistent:
-- Defining `den.aspects.foo.policies.bar` both registers and activates the policy — there is no way to store a policy without activating it
-- Scope is determined by definition site (global, schema, aspect) but this is emergent behavior, not an explicit design
-- No fine-grained scoping — "this policy applies only to igloo's subtree" requires guards in the policy body
-- `meta.handleWith` and `meta.excludes` are parallel mechanisms that are semantically scoped policies but use separate constraint registry machinery
-
-### 9.2 Proposed Design: Registry vs Activation
-
-`.policies` becomes the **registry** (stores policy functions). `includes`/`excludes` becomes the **activation method** (controls where policies fire).
-
-Policy scoping levels:
-
-| Level | Scope | Activation |
-|---|---|---|
-| Pipeline | Entire pipeline run | Pipeline configuration |
-| Global | All entities, all scopes | `den.policies.*` (preserved) |
-| Entity-kind | All entities of a kind | `den.schema.*.policies.*` (preserved) |
-| Entity-instance | A specific entity | Include policy on the entity's aspect |
-| Aspect subtree | Within an aspect's include tree | Include policy in aspect's includes |
-
-Policies become first-class values placeable in `includes` and `excludes`:
-
-```nix
-den.aspects.igloo.includes = [ den.aspects.myBattery.policies.deliver-niri ];
-den.aspects.server.excludes = [ den.policies.strict-firewall ];
-```
-
-### 9.3 meta.handleWith Unification
-
-`meta.handleWith` (constraint handlers) and `meta.excludes` (sugar for exclude constraints) would be replaced by policy effects in `includes`:
-
-```nix
-# Current:
-den.aspects.server.meta.excludes = [ den.aspects.desktop ];
-
-# Proposed:
-den.aspects.server.includes = [ (policy.exclude den.aspects.desktop) ];
-```
-
-A new `policy.filter` effect would replace the filter type in the constraint registry.
-
-### 9.4 Open Questions
-
-1. Policy identity for `excludes` matching — function identity in Nix is referential (same thunk = same policy); whether this suffices or explicit naming is needed
-2. Ordering sensitivity between included policies and included aspects
-3. Whether entity-instance excludes can override global policies
-4. Migration path for `meta.handleWith` users with custom handler types
-
-### 9.5 Dependency
-
-This work depends on provides removal — the constraint registry simplification should happen first to reduce the surface area.
-
----
-
-## 9. Planned Redesign: Unified Resolve Effects
-
-**Spec:** `design/unified-resolve-effects.md`
-
-### Changes to Policy Dispatch
-
-- **Enrichment drain:** `drainEnrichmentDeferred` (explicit function call inside iterate's scope.provide) is replaced by `enterScope` + automatic `scope-widened` handler. The iterate loop uses `enterScope` instead of raw `scope.provide` for enrichment widen — drain fires automatically at scope entry.
-
-- **installPolicies entry:** Unchanged externally. Internally, it calls the iterate loop which uses `enterScope`.
-
-- **Late dispatch pass:** Unchanged. Uses raw `scope.provide` (no drain needed — late dispatch only emits effects, doesn't create new deferrable aspects).
-
-### File Changes
-
-- `policy/iterate.nix`: `drainEnrichmentDeferred` deleted. `iterate`'s widen branch uses `enterScope` instead of `scope.provide + explicit drain`.
-- `policy/default.nix`: `installPolicies` unchanged (entry point semantics preserved).
-- `policy/schema.nix`: `lateDispatchPass` unchanged (no drain involved).
+| File | Role |
+|---|---|
+| `nix/lib/policy-effects.nix` | All effect constructors and combinators |
+| `nix/lib/synthesize-policies.nix` | `resolveArgsSatisfied` |
+| `nix/lib/aspects/policy-type.nix` | `policyRegistryType` (NixOS module type) |
+| `nix/lib/aspects/fx/policy/default.nix` | `installPolicies` entry point |
+| `nix/lib/aspects/fx/policy/dispatch.nix` | `mkDispatch`, `dispatchAspect` |
+| `nix/lib/aspects/fx/policy/classify.nix` | `classifyPolicyResult`, cross-provider tagging |
+| `nix/lib/aspects/fx/policy/iterate.nix` | Fixed-point enrichment loop |
+| `nix/lib/aspects/fx/policy/schema.nix` | Schema resolve processing, late dispatch pass |
+| `nix/lib/aspects/fx/policy/apply.nix` | Effect emission (`policyEmitIncludes`, `policyEmitExcludes`, etc.) |
+| `nix/lib/aspects/fx/handlers/dispatch-policies.nix` | Dispatch handler (constraint filtering) |
+| `nix/lib/aspects/fx/handlers/emit-policy-effects.nix` | Final emission handler |
+| `nix/lib/aspects/fx/handlers/policy.nix` | `register-aspect-policy` handler |
+| `modules/policies/core.nix` | `host-to-users` policy |
+| `modules/policies/flake.nix` | Flake output policies |
