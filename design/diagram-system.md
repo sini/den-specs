@@ -355,8 +355,8 @@ The render context (`diag.renderContext`) bundles theme, renderers, SVG builders
 
 Three visualization capabilities are planned but not yet implemented:
 
-### Trait Flow Visualization
-Deferred until traits are reimplemented. Would show how trait definitions flow through the aspect resolution tree -- which aspects provide traits, which consume them, and how trait values are transformed by the resolution pipeline.
+### Pipe Flow Visualization
+Deferred until pipe visualization is added (see `pipes-and-quirks.md`). Would show how pipe data (den.quirks) flows through the aspect resolution tree -- which aspects produce quirk keys, which class modules consume aggregated pipe data, and how pipe.collect gathers cross-scope values. The trait system was removed and replaced by pipes; this view tracks the replacement.
 
 ### Fleet Policy Topology
 Would visualize the policy dispatch graph across an entire fleet -- which policies fire on which hosts, how policy routing decisions differ between entity kinds, and where policy chains create cross-host dependencies.
