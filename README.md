@@ -53,12 +53,12 @@ These describe the pipeline as it exists today (753/753 tests on feat/fx-pipelin
 |-----------|------|---------|
 | **Provides Cleanup** | [design/provides-cleanup.md](design/provides-cleanup.md) | `provides`/`_` stays as permanent user API (virtual sub-aspect namespace). `provides-compat.nix` deleted; functionality folded into `emitAspectPolicies`. Self-provide and cross-entity routing handled in one pipeline phase. `resolveChildren` simplifies from 5 phases to 3. New users use policies + direct nesting; existing patterns unchanged. |
 
-### Planned (Not Yet Implemented)
+### Cancelled / Superseded
 
 | Component | Spec | Summary |
 |-----------|------|---------|
-| **Traits** | [design/traits.md](design/traits.md) | Semantic data channels collected across aspects at pipeline time. `scope.provide` resolves parametric values before collection — no classification needed. Schema registry (`den.traits`) with collection strategies. `{ traitName, ... }:` consumption in discriminators and class modules. ~250 lines estimated, 10x simpler than the deleted implementation. |
-| **Fleet + den.exports** | [design/fleet-and-exports.md](design/fleet-and-exports.md) | Cross-host data via lazy `fleet` attrset of evaluated NixOS configs + `den.exports` freeform option. Replaces the original provide-to mechanism and config-dependent trait values. Uses Nix laziness directly — no pipeline involvement, no custom distribution phase. |
+| **Traits (superseded)** | [cancelled/traits-reimplementation-design.md](cancelled/traits-reimplementation-design.md) | Pre-implementation design for trait system reimplementation. Superseded by [Pipes and Quirks](design/pipes-and-quirks.md) which implements the same data channel concept with a simpler architecture. |
+| **Fleet + den.exports (absorbed)** | [cancelled/fleet-and-exports-design.md](cancelled/fleet-and-exports-design.md) | Cross-host data via lazy `fleet` attrset. Core use case absorbed by `pipe.collect` + config thunks. The `fleet` module arg may still land as an orthogonal convenience. |
 
 ### Proposed: Stream Architecture (Den 2)
 
