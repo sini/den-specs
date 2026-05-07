@@ -1,467 +1,299 @@
-# Entity Resolution and Schema System
+# Entity Resolution
 
-**Date:** 2026-05-04
-**Branch:** feat/fx-pipeline (713/713 tests)
-**Scope:** How den defines entity kinds, registers classes, resolves entities through the pipeline, and structures the three-layer model.
+Den's entity system defines the structural units of a configuration: hosts, users, homes, and the flake-level routing scaffolding that connects them. Each entity kind is declared through `den.schema`, a freeform registry whose merge logic separates structural entity kinds (which carry content and participate in the aspect pipeline) from routing kinds (which exist solely for policy-driven traversal). Entity resolution is the process of converting a schema entry and a context into a pipeline-ready aspect with scope handlers, self-provide, and static includes. The topology -- which entities contain which others -- is not declared explicitly but emerges from policy wiring.
 
-This document describes the current implementation, not aspirational design.
+## Schema Declaration
 
----
+`den.schema` is a freeform submodule option with `lazyAttrsOf schemaEntryType`. Each attribute key names an entity kind; the value is a deferred module with extended merge semantics.
 
-## 1. den.schema: Entity Kind Registry
+### Schema Entry Type
 
-### 1.1 Option Definition
+`schemaEntryType` extends `deferredModule` with a custom merge that performs four operations on the collected definitions:
 
-`den.schema` is declared in `modules/options.nix` as a freeform submodule with `lazyAttrsOf schemaEntryType`:
+1. **Extract includes.** Definitions that contain a list-valued `includes` field have those lists concatenated into a combined include set. The `includes` field is stripped from each definition before the deferred module merge.
 
-```nix
-options.den.schema = lib.mkOption {
-  type = lib.types.submodule {
-    freeformType = lib.types.lazyAttrsOf schemaEntryType;
-  };
-  default = {};
-};
+2. **Extract excludes.** Same extraction for list-valued `excludes` fields.
+
+3. **Deferred merge.** The stripped definitions are passed to the base `deferredModule` merge, producing the structural module content.
+
+4. **Entity gating.** Two predicates determine the entry's role:
+
+   - `hasStructuralContent` -- true when any definition contributes module content beyond `includes` and `excludes` (the stripped definition is non-empty or not an attrset).
+   - `hasEntityContent` -- true when the kind is not `conf` AND at least one of: includes are non-empty, excludes are non-empty, or there is structural content.
+
+The merged result is a callable attrset with `__functor`, `includes`, `excludes`, and `isEntity`:
+
+- When `hasEntityContent` is true, the functor wraps the merged module and injects three options into the entity's module evaluation: `id_hash`, `resolved`, and `collisionPolicy` (described below). `isEntity` equals `hasStructuralContent`.
+- When `hasEntityContent` is false, the functor passes through the bare module. `isEntity` is false and `includes`/`excludes` are empty.
+
+### Injected Options
+
+Entity kinds with content receive three options:
+
+**`id_hash`** (internal, read-only, `str`) -- a SHA-256 hash of `"kind|key1=val1|key2=val2|..."` computed by reflecting on all non-internal, primitive-typed options (`str`, `int`, `bool`) declared on the entity. Provides stable identity comparison: use `a.id_hash != b.id_hash` instead of Nix's `==`, which does deep structural comparison and diverges across module system boundaries.
+
+**`resolved`** (read-only, `raw`) -- the entity's pipeline-ready representation. Built by filtering `_module.args` to known schema kinds, adding `{ ${kind} = config; }`, and passing the result to the entity resolution function. This is the bridge from the NixOS module system into the pipeline.
+
+**`collisionPolicy`** (nullable enum: `"error"`, `"class-wins"`, `"den-wins"`) -- per-entity override for how argument collisions between den context and module-system arguments are handled in flat-form class modules.
+
+### Default Schema Entries
+
+The framework registers these entries by default:
+
+| Kind | Source | Body | Imports |
+|---|---|---|---|
+| `conf` | `modules/options.nix` | empty | -- |
+| `host` | `modules/options.nix` | empty (structural content comes from entity type) | `den.schema.conf` |
+| `user` | `modules/options.nix` | empty (structural content comes from entity type) | `den.schema.conf` |
+| `home` | `modules/options.nix` | empty (structural content comes from entity type) | `den.schema.conf` |
+| `flake` | `modules/context/flake-schema.nix` | empty | -- |
+| `flake-system` | `modules/context/flake-schema.nix` | empty | -- |
+| `default` | `modules/context/flake-schema.nix` | empty | -- |
+
+`conf` is a shared configuration base module imported by host, user, and home. It is hardcoded as a non-entity (`kind != "conf"` in the gating predicate) and never participates in pipeline resolution.
+
+When `den.default` is defined, `modules/aspects/defaults.nix` injects it as a schema include for host, user, and home, so the default aspect is resolved automatically for all structural entity kinds.
+
+## Entity Kinds
+
+### Structural Entities vs Routing Kinds
+
+`schemaEntityKinds` (computed in `nix/lib/schema-util.nix`) filters the schema to kinds that are true entities:
+
+```
+filter each kind where: kind != "conf" AND NOT prefixed with "_" AND isEntity == true
 ```
 
-Each key under `den.schema` names an **entity kind**. The value is a `schemaEntryType` -- a custom type based on `deferredModule` with an extended merge function that extracts `includes` and `policies` from definitions before deferring the rest.
+A kind qualifies as an entity when its schema entry has structural module content -- actual options, imports, or configuration beyond just `includes`/`excludes`. Structural entities get self-provide (their `.aspect` field is resolved through the pipeline) and appear in derived binding lookups.
 
-### 1.2 schemaEntryType Merge
+Routing kinds (`flake`, `flake-system`, `default`) have empty schema bodies, so `isEntity` is false. They exist for policy dispatch targeting but do not carry aspects or participate in self-provide.
 
-The merge function (`options.nix` lines 33-186) does several things:
+### Built-in Entity Kinds
 
-1. **Extracts `includes`** from all definitions that provide a list-valued `includes` field. These are concatenated into `allIncludes`.
+| Kind | `isEntity` | Self-Provide | Carries | Purpose |
+|---|---|---|---|---|
+| `host` | true | `host.aspect` | name, hostName, system, class, users, instantiate, intoAttr | OS configuration unit |
+| `user` | true | `user.aspect` | name, userName, classes, host (back-ref) | User account within a host |
+| `home` | true | `home.aspect` | userName, hostName, system, pkgs, instantiate, intoAttr | Home-manager configuration (standalone or host-bound) |
+| `conf` | always false | none | -- | Shared base module imported by host/user/home |
+| `flake` | false | none | -- | Root of flake-level pipeline traversal |
+| `flake-system` | false | none | system | Per-system scope for flake outputs |
+| `default` | false | special: `den.default` | -- | Global default aspect |
 
-2. **Extracts `policies`** from all definitions that provide an attrset-valued `policies` field. These are merged with `//` (last-wins).
+### Custom Entity Kinds
 
-3. **Strips `includes` and `policies`** from definitions before passing them to the base `deferredModule` merge.
+Any module can register new entity kinds by setting `den.schema.<name>`. If the entry has structural content, it becomes a full entity kind with `isEntity = true`, self-provide, and pipeline participation. If empty, it is a routing kind for policy dispatch only. The `fleet` kind used in fleet configurations is an example of a user-defined entity kind, not a framework built-in.
 
-4. **Gates entity behavior** via two predicates:
-   - `hasStructuralContent`: true if any definition has module content beyond just `includes`/`policies` (i.e., the stripped definition is non-empty or non-attrset).
-   - `hasEntityContent`: true if `kind != "conf"` AND (`allIncludes != []` OR `hasStructuralContent`).
+## Three-Layer Composition
 
-5. **Returns a callable attrset** with:
-   - `__functor`: wraps the merged deferred module. If `hasEntityContent`, injects `resolvedCtx` (identity hash, resolved entity, collision policy options). Otherwise, passes through the bare module.
-   - `includes`: the extracted include list.
-   - `policies`: the extracted policies attrset.
-   - `isEntity`: equals `hasStructuralContent`. This controls whether the kind participates in pipeline resolution with self-provide.
+Entity resolution combines content from three layers, each with different activation semantics.
 
-### 1.3 Injected Options (resolvedCtx)
+### Layer 1: Aspects (Registry)
 
-When a schema entry has entity content, `resolvedCtx` injects three options into the entity's module evaluation:
+`den.aspects` is the global aspect registry. Each entity's `.aspect` field references a named aspect. During resolution, self-provide injects this aspect as an include, making it the root of the entity's content tree. Aspects may be parametric (taking entity context arguments) or static, and they declare class content, nested aspects, includes, and policies.
 
-- **`id_hash`** (internal, read-only): SHA-256 of `"kind|key1=val1|key2=val2|..."` covering all non-internal primitive-typed options (str, int, bool). Used for entity identity comparison instead of Nix's fragile `==`.
+### Layer 2: Policies (Inclusion)
 
-- **`resolved`** (read-only, raw): Calls `den.lib.resolveEntity kind ctx` where `ctx` is built from `_module.args` filtered to known schema kinds, plus `{ ${kind} = config; }`.
+Policies are functions from entity context to lists of typed effects. They control topology (creating child entity scopes via resolve effects), content routing (via route and provide effects), and conditional inclusion/exclusion. Policies fire based on argument signature satisfaction -- a policy `{ host, user, ... }:` only fires when both `host` and `user` are present in the resolve context. See [policy-system.md](policy-system.md) for the full policy reference.
 
-- **`collisionPolicy`** (nullable enum): Per-entity override for class module collision handling (`"error"`, `"class-wins"`, `"den-wins"`).
+Policies are activated by being referenced in `den.schema.*.includes` or `den.default.includes`. The `den.policies` namespace is a named registry only -- it does not auto-dispatch.
 
-### 1.4 Default Schema Entries
+### Layer 3: Schema Includes (Static)
 
-**`modules/options.nix` config section:**
-```nix
-config.den.schema = {
-  conf = {};                        # shared base, not an entity
-  host.imports = [ den.schema.conf ];
-  user.imports = [ den.schema.conf ];
-  home.imports = [ den.schema.conf ];
-};
+`den.schema.<kind>.includes` holds a list of aspects and policies statically included when any entity of that kind is resolved. These are extracted during the schema entry type merge and concatenated after self-provide. Schema includes do not depend on runtime context -- they are identical for every entity of a given kind.
+
+### Composition Order
+
+When an entity is resolved, includes are assembled in this order:
+
+1. **Self-provide** -- the entity's own `.aspect` (for structural entity kinds) or `den.default` (for the default kind)
+2. **Schema includes** -- static includes from `den.schema.<kind>.includes`
+3. **Policy includes** -- aspects injected by policy `include` effects during dispatch
+4. **Resolve includes** -- per-resolve scoped includes carried on resolve effects
+
+## Entity Resolution Lifecycle
+
+The `resolve-schema-entity` effect handler orchestrates a complete entity resolution cycle. Each entity kind that a policy resolves into goes through this sequence:
+
+### 1. Push Scope
+
+A new scope partition is created. The entity's context bindings are installed as scope handlers (constant effect handlers returning context values). The scope is registered in pipeline state with a parent reference and inherits the parent's aspect policies.
+
+### 2. Resolve Entity
+
+The entity resolution function is called with the target kind and context. It produces an aspect-shaped record containing:
+
+- `name` -- the entity kind
+- `includes` -- self-provide + schema includes + policy includes + resolve includes
+- `__entityKind` -- tags the aspect for policy dispatch gating
+- `__scopeHandlers` -- constant handlers wrapping the entity context
+
+Self-provide for structural entity kinds is a parametric wrapper that defers resolution of the entity's `.aspect` field until the scope's handlers are established. This prevents eager evaluation of the aspect before context is available.
+
+### 3. Resolve (Tree Walk)
+
+The merged entity is submitted to the resolve effect, which walks the aspect tree: compiling static content, emitting class modules, resolving child includes, and dispatching policies at entity boundaries.
+
+### 4. Drain
+
+After the entity's tree walk completes, deferred parametric includes that became satisfiable in this scope are collected. Each satisfiable deferred is tagged with the scope's handlers and resolved through the tree walk.
+
+### 5. Propagate Routes
+
+Routes registered at root scope that target this scope's partition are propagated. This ensures class content routed across scope boundaries reaches the correct destination.
+
+### 6. Restore Scope
+
+The scope is popped, returning to the parent scope. Results from this entity's resolution are accumulated with results from sibling entities.
+
+## Topology Chain
+
+Den's entity topology is not declared explicitly. It emerges from policy wiring: each policy that emits a resolve effect creates a parent-child relationship between entity kinds. The built-in policies produce this chain:
+
+```
+flake
+  └─ flake-system (one per system in den.systems)
+       ├─ host (one per host in den.hosts.${system})
+       │    └─ user (one per user in host.users, shared scope)
+       ├─ home (one per home in den.homes.${system})
+       └─ [output routes: packages, apps, checks, devShells, legacyPackages]
 ```
 
-`conf` is a shared configuration base module. It is excluded from entity processing (`hasEntityContent` returns false for `kind == "conf"`). `host`, `user`, and `home` all import `conf`, inheriting any shared schema content.
+### How the Chain Forms
 
-**`modules/context/flake-schema.nix`:**
-```nix
-den.schema = lib.genAttrs [ "flake" "flake-system" "default" ] (_: {});
-```
+1. **flake -> flake-system:** The `to-systems` policy, activated via `den.schema.flake.includes`, maps each system string in `den.systems` to a `resolve.to "flake-system" { inherit system; }` effect.
 
-Registers three routing kinds with empty bodies. Empty body means `isEntity = false` -- these kinds exist for policy routing but don't carry structural content or self-provide aspects.
+2. **flake-system -> host:** The `to-os-outputs` policy, activated via `den.schema.flake-system.includes`, iterates `den.hosts.${system}` and emits `resolve.to "host" { inherit host; }` plus an instantiation effect for each host with a non-empty `intoAttr`.
 
-**`modules/aspects/defaults.nix`:**
-```nix
-config.den.schema = lib.mkIf (den ? default) (
-  lib.genAttrs [ "host" "user" "home" ] (_: {
-    includes = [ den.default ];
-  })
-);
-```
+3. **host -> user:** The `host-to-users` policy, activated via `den.schema.host.includes`, maps each user in `host.users` to `resolve.shared { inherit user; }`. The `shared` variant means users share the host scope rather than getting isolated partitions.
 
-Injects `den.default` as a schema include for host, user, and home entities.
+4. **flake-system -> home:** The `to-hm-outputs` policy follows the same pattern as `to-os-outputs` for standalone home-manager configurations.
 
-### 1.5 Schema Policies
+5. **flake-system -> outputs:** Per-output route policies (`to-packages`, `to-apps`, etc.) use `policy.route` to wire class content from per-system scope partitions into the flake output tree.
 
-Policies can be declared directly on schema entries:
+### Extending the Topology
 
-```nix
-den.schema.host.policies.host-to-users = { host, ... }:
-  map (user: resolve.shared { inherit user; }) (lib.attrValues host.users);
-```
+User configurations extend this chain by declaring new entity kinds and policies. For example, a fleet configuration adds a `fleet` kind between `flake-system` and `host`, creating: `flake -> flake-system -> fleet -> host -> user`.
 
-The merge function collects all `policies` attrs from definitions and returns them on the merged result. `installPolicies` in the pipeline reads `(den.schema.${kind} or {}).policies or {}` to discover entity-scoped policies.
+## Derived Bindings
 
----
+When an entity is resolved, the entity resolution function checks whether the entity record carries references to other entity kinds. For example, a `home` entity may carry `host` and `user` fields that reference the associated host and user entities.
 
-## 2. den.classes Registry
+The derived bindings logic:
 
-### 2.1 Option Definition
+1. Reads the entity record from context (e.g., `ctx.home`)
+2. Filters its attributes to those matching `schemaEntityKinds` names
+3. Excludes the entity's own kind, null values, non-attrset values, and keys already present in context
+4. Merges the discovered bindings into the context
 
-```nix
-options.den.classes = lib.mkOption {
-  type = lib.types.lazyAttrsOf classSchemaType;
-  default = {};
-};
-```
+This enables downstream policies and class modules to access related entities without explicit wiring. A `home` entity that carries `host` and `user` fields automatically makes those available in the resolve context, so a policy `{ home, host, ... }:` can fire without the host being explicitly passed through a resolve effect.
 
-`classSchemaType` is a submodule with:
-- `description` (str): human-readable description.
-- `forwardTo` (nullable raw): optional forward target for class evaluation.
+The augmented context also propagates any `collisionPolicy` set on the schema entry, accumulating it in `__collisionPolicies` keyed by entity kind.
 
-### 2.2 Built-in Classes
+## Entity Types
 
-`modules/options.nix` registers two:
-```nix
-config.den.classes = {
-  nixos.description = "NixOS system configuration";
-  darwin.description = "nix-darwin system configuration";
-};
-```
+### Host
 
-`modules/policies/flake.nix` registers flake output classes:
-```nix
-den.classes = lib.listToAttrs (
-  map (output: {
-    name = output;
-    value.description = "Flake ${output} output class";
-  }) [ "packages" "apps" "checks" "devShells" "legacyPackages" ]
-);
-```
-
-### 2.3 Dynamic Collection (aspect-schema.nix)
-
-`modules/aspect-schema.nix` collects `classes` declarations from aspects and namespaces:
-
-1. Iterates `config.den.aspects`, reading `a.classes or {}` from each.
-2. Iterates `config.den.ful.*` namespaces, collecting classes from namespace-level aspects and from `den.ful.<ns>.classes`.
-3. Merges everything with `//` into `config.den.classes`.
-
-This enables aspects to declare new class domains:
-```nix
-den.aspects.foo.classes.hjem = { description = "Hjem home configuration"; };
-```
-
-### 2.4 Role in Key Classification
-
-`key-classification.nix` uses `den.classes` as the class registry. When classifying non-structural keys on an aspect:
-
-1. If the key matches a registered class name (or the current target class), it is a **class key** -- content is emitted via `emit-class`.
-2. If the key contains sub-keys that match registered classes (depth-limited to 3), it is a **nested aspect key** -- recursed via `emitNestedAspect`.
-3. Otherwise, it is an **unregistered class key** -- treated as a class for backward compatibility, with trace warning.
-
-When the registry is empty (no batteries loaded), all non-structural keys are treated as classes.
-
-### 2.5 Current State: No Traits
-
-The `den.traits` option was removed during the cleanup arc. Only `den.classes` exists. Key classification is two-branch (class vs nested aspect), not three-branch. Trait reimplementation is planned via fleet + `den.exports`.
-
----
-
-## 3. Entity Resolution: resolveEntity
-
-### 3.1 Implementation
-
-`nix/lib/resolve-entity.nix` exports a single function:
+Declared in `nix/lib/entities/host.nix` as a nested submodule. Hosts are grouped by system under `den.hosts`:
 
 ```nix
-resolveEntity = name: ctx: { ... }
+den.hosts.x86_64-linux.myhost = { ... };
 ```
 
-**Parameters:**
-- `name`: entity kind string (e.g., `"host"`, `"user"`, `"flake-system"`).
-- `ctx`: attrset of context bindings (e.g., `{ host = <hostConfig>; user = <userConfig>; }`).
+Key fields:
 
-**Returns** an aspect-shaped attrset:
-```nix
-{
-  name = <kind>;
-  meta = { handleWith = null; excludes = []; provider = []; };
-  includes = selfProvide ++ schemaIncludes;
-  __entityKind = <kind>;
-  __scopeHandlers = constantHandler ctx;
-}
-```
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | `str` | attribute name | Configuration name |
+| `hostName` | `str` | `name` | Network hostname |
+| `system` | `str` | parent key | Platform system string |
+| `class` | `str` | inferred from system | `"nixos"` or `"darwin"` |
+| `aspect` | `raw` | looked up from `den.aspects` | Root aspect for this host |
+| `users` | `attrsOf userType` | `{}` | User accounts on this host |
+| `instantiate` | `raw` | from `class` | System builder function (e.g., `nixpkgs.lib.nixosSystem`) |
+| `intoAttr` | `listOf str` | from `class` | Flake output path (e.g., `["nixosConfigurations" name]`) |
+| `mainModule` | `deferredModule` | resolved from aspect | Final module passed to instantiation |
 
-### 3.2 Self-Provide
+The host type imports `den.schema.host`, inheriting any shared `conf` content and entity options.
 
-The self-provide mechanism injects the entity's own aspect as an include, resolved lazily via parametric resolution:
+### User
 
-- **For `"default"`**: includes `[ den.default ]` (if `den ? default`).
-- **For aspect-bearing entity kinds** (host, user, home -- determined by `schemaEntityKinds` from `schema-util.nix`): includes a parametric wrapper:
-  ```nix
-  {
-    __fn = c: c.${name}.aspect;
-    __args = { ${name} = false; };
-    name = "<self:${name}>";
-    meta = {};
-    includes = [];
-  }
-  ```
-  This wrapper resolves during parametric handling: `bind.fn` probes the scope for a handler named by the entity kind (e.g., `"host"`), retrieves the entity config, and calls `c.host.aspect` to get the aspect content.
-- **For non-aspect kinds** (flake, flake-system, conf): no self-provide. Returns empty `includes` (before schema includes are appended).
-
-### 3.3 schemaEntityKinds
-
-`nix/lib/schema-util.nix` computes entity kinds from the schema:
+Declared as a submodule nested within a host's `users` attribute:
 
 ```nix
-schemaEntityKinds = builtins.filter (
-  k: k != "conf" && !(lib.hasPrefix "_" k) && (den.schema.${k}.isEntity or false)
-) (builtins.attrNames (den.schema or {}));
+den.hosts.x86_64-linux.myhost.users.tux = { ... };
 ```
 
-A kind qualifies if: (a) not `"conf"`, (b) not private (no `_` prefix), and (c) `isEntity == true` on its schema entry. `isEntity` is set during `schemaEntryType` merge based on whether the entry has structural content.
+Key fields:
 
-### 3.4 Schema Includes
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | `str` | attribute name | Configuration name |
+| `userName` | `str` | `name` | Account name |
+| `classes` | `listOf str` | `["user"]` | Home management nix classes |
+| `aspect` | `raw` | looked up from `den.aspects` | Root aspect for this user |
+| `host` | (back-ref) | parent host | Reference to the containing host |
+
+The user type imports `den.schema.user` and receives `host` via `_module.args`.
+
+### Home
+
+Declared in `nix/lib/entities/home.nix`. Homes are grouped by system under `den.homes` and support a `user@host` naming convention for host-bound configurations:
 
 ```nix
-schemaIncludes = ((den.schema or {}).${name} or {}).includes or [];
+den.homes.x86_64-linux."tux@myhost" = { ... };
+den.homes.x86_64-linux.standalone-user = { ... };
 ```
 
-These are the static includes extracted by `schemaEntryType` merge -- aspects and modules declared directly on `den.schema.<kind>.includes`.
+When the name contains `@`, the home automatically resolves the host from `den.hosts` and the user from that host's users, making both available as context bindings.
 
-### 3.5 __scopeHandlers
+Key fields:
 
-`resolveEntity` wraps the context as `constantHandler ctx`. Each context key becomes a named effect handler that returns its value when probed. This is how context propagates through the pipeline -- `bind.fn` probes for handlers matching function argument names.
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | `str` | user part of attribute name | Configuration name |
+| `userName` | `str` | `name` | Account name |
+| `hostName` | `str?` | host part after `@`, or null | Associated host name |
+| `system` | `str` | parent key | Platform system string |
+| `class` | `str` | `"homeManager"` | Always homeManager |
+| `aspect` | `raw` | looked up from `den.aspects` | Root aspect for this home |
+| `host` | (back-ref) | resolved from name, or null | Associated host entity |
+| `user` | (back-ref) | resolved from name, or null | Associated user entity |
+| `pkgs` | `raw` | `nixpkgs.legacyPackages.${system}` | Nixpkgs instance |
+| `instantiate` | `raw` | `homeManagerConfiguration` | Builder function |
+| `intoAttr` | `listOf str` | `["homeConfigurations" name]` | Flake output path |
 
-### 3.6 __entityKind
+For host-bound homes (`user@host`), the instantiation function is wrapped to inject `osConfig` from the host's evaluated configuration via `extraSpecialArgs`.
 
-Tags the resolved entity with its kind. The pipeline uses this to gate policy dispatch: `installPolicies` only runs for aspects with `__entityKind` set (see `resolveChildren` in `aspect.nix`).
+## Invariants
 
----
+1. **Entity gating separates entities from routing kinds.** Only kinds with `isEntity = true` (structural content) get self-provide and participate in aspect resolution. Routing kinds exist for policy dispatch targeting only.
 
-## 4. resolve-schema-entity Effect
+2. **Topology is implicit, not declared.** No entity kind knows its position in the hierarchy. Nesting order emerges entirely from policy wiring -- the same kind can appear at different positions in different configurations.
 
-### 4.1 Purpose
+3. **Self-provide for entity kinds.** Each structural entity kind automatically includes a parametric wrapper that resolves its `.aspect` field. This is the bridge from entity declarations (`den.hosts`, `den.homes`) to the aspect registry (`den.aspects`).
 
-`handlers/resolve-schema-entity.nix` provides the `resolve-schema-entity` effect handler. This is the reusable entity resolution primitive: scope push, entity walk, scope pop. Policy dispatch uses it to resolve target entities.
+4. **conf is never an entity.** The `conf` kind is hardcoded as excluded from entity processing, regardless of content. It serves as a shared base module only.
 
-### 4.2 Parameters
+5. **Derived bindings are additive.** Entity-carried references to other entity kinds are merged into context only when the target kind is not already present. Existing context values are never overwritten.
 
-The effect receives:
-```nix
-{
-  targetKind;      # entity kind to resolve (e.g., "user")
-  scopedCtx;       # full context for the new scope
-  entityClass;     # optional class override
-  includeAspects;  # aspects from policy includes
-  policyIncludes;  # includes from policy.resolve.withIncludes
-  resolveIncludes; # includes from the resolve effect itself
-  ctxNames;        # context key names for tracing
-  prevResults;     # accumulated results from prior sibling resolves
-}
-```
+6. **Identity hashing over structural equality.** Entity comparison uses `id_hash` (SHA-256 of primitive option values) rather than Nix's `==` operator, which diverges on recursive module system thunks.
 
-### 4.3 Execution Sequence
+7. **Schema includes are kind-uniform.** Every entity of a given kind receives the same static includes. Per-entity variation comes from aspects and policies, not from schema includes.
 
-1. **Compute scope ID**: `mkScopeId scopedCtx` produces a canonical `"key=value,..."` string.
-
-2. **Build scope transition**: `mkScopeTransition` creates three operations:
-   - `scopeHandlersForCtx`: `constantHandler` wrapping the scoped context (plus optional class override).
-   - `setScope`: `state.modify` that sets `currentScope`, registers the scope in `scopeContexts`, sets `scopeParent`, and inherits `scopedAspectPolicies` from parent.
-   - `restoreScope`: `state.modify` that resets `currentScope` to parent.
-
-3. **Push scope**: Execute `setScope`.
-
-4. **Copy parent deferred items**: Parent-scope deferred includes are copied into the new scope. This enables fan-out: a `{ host, user }` deferred at host scope gets a fresh copy in each user scope.
-
-5. **Install scope handlers**: `scope.provide scopeHandlersForCtx` makes entity context available to the subtree.
-
-6. **Resolve entity**: Send `resolve-entity` effect with `kind = targetKind`. The `resolveEntityHandler` in `pipeline.nix` handles this by calling `den.lib.resolveEntity`.
-
-7. **Merge includes**: The raw entity's includes are concatenated with `includeAspects`, `policyIncludes`, and `resolveIncludes` (all stripped of stale `__ctxId` to prevent identity mismatches).
-
-8. **Walk tree**: `aspectToEffect entity` processes the merged entity through the pipeline -- compileStatic, emitClasses, resolveChildren, installPolicies.
-
-9. **Drain deferred**: Send `drain-deferred` to resolve any parametric includes that became satisfiable in this scope.
-
-10. **Walk deferred results**: Each satisfiable deferred include is tagged with the scope's handlers and processed via `aspectToEffect`.
-
-11. **Propagate root routes**: Complex routes registered at root scope are copied to the child scope with `sourceScopeId` pointing at the child's partition.
-
-12. **Restore scope**: Execute `restoreScope` to pop back to parent.
-
-### 4.4 den.default Stripping
-
-The `resolveEntityHandler` in `pipeline.nix` (not `resolve-schema-entity.nix`) strips `den.default` from child entity includes before returning. This prevents duplicate module definitions: `den.default` is walked once at root scope, and child entities get its shared modules via filtered root fallback in `applyForwardSpecs`.
-
----
-
-## 5. The Three-Layer Model
-
-### 5.1 Layer 1: Aspects (Registry)
-
-`den.aspects` is the global aspect registry. Aspects are named definitions that may be parametric (taking entity context arguments) or static. They declare class content, nested aspects, includes, policies, and constraints.
-
-Aspects are referenced directly by value (not by string name) in policy effects and schema includes. Example:
-
-```nix
-den.aspects.my-firewall = { host, ... }: {
-  nixos.networking.firewall.enable = true;
-};
-```
-
-### 5.2 Layer 2: Policies (Inclusion and Routing)
-
-Policies are plain functions returning lists of typed effects. They are declared on schema entries (`den.schema.<kind>.policies.<name>`) or via the provides-compat shim.
-
-Policy effects:
-- `policy.resolve { user = tux; }` -- create a new entity scope (fan-out).
-- `policy.resolve.shared { user = tux; }` -- shared (non-isolated) fan-out.
-- `policy.resolve.to "kind" { bindings }` -- explicit target kind.
-- `policy.resolve.withIncludes [aspects] { bindings }` -- resolve with scoped includes.
-- `policy.include aspect` -- inject an aspect into current resolution context.
-- `policy.exclude aspect` -- gate an aspect from the tree.
-- `policy.route { fromClass, intoClass, path, ... }` -- route class content between scope partitions.
-- `policy.instantiate entity` -- request post-pipeline instantiation.
-- `policy.provide { class, module, ... }` -- deliver content directly to a class.
-- `policy.pipelineOnly value` -- tag with `collisionPolicy = "class-wins"`.
-
-Policies fire based on argument satisfaction: a policy `{ host, user, ... }:` fires only when both `host` and `user` are in scope. `installPolicies` dispatches policies via context enrichment iteration.
-
-### 5.3 Layer 3: Schema Includes (Static)
-
-`den.schema.<kind>.includes` holds a list of aspects/modules statically included when an entity of that kind is resolved. These are picked up by `resolveEntity` and concatenated after the self-provide.
-
-Examples:
-- `den.schema.host.includes = [ den.schema.conf ];` (base conf module)
-- `den.schema.host.includes = [ den.default ];` (from defaults.nix, conditional)
-
-Schema includes do not depend on runtime context -- they are the same for every entity of that kind.
-
-### 5.4 How the Layers Compose
-
-When an entity is resolved:
-
-1. `resolveEntity` produces the root aspect with:
-   - Self-provide (the entity's own `.aspect` via parametric wrapper)
-   - Schema includes (static, from `den.schema.<kind>.includes`)
-
-2. The pipeline walks this root aspect via `aspectToEffect` -> `compileStatic` -> `resolveChildren`.
-
-3. `resolveChildren` calls `installPolicies` (only for aspects tagged with `__entityKind`). `installPolicies`:
-   - Reads `den.schema.${kind}.policies` for entity-scoped policies.
-   - Reads accumulated `scopedAspectPolicies` from parent scopes.
-   - Dispatches satisfied policies, which emit effects (resolve, include, route, etc.).
-   - For `policy.resolve`, sends `resolve-schema-entity` to recursively resolve child entities.
-
-4. Child entities repeat from step 1, inside a `scope.provide` frame that provides the expanded context.
-
----
-
-## 6. Entity Kinds in Current Use
-
-### 6.1 host
-
-- **Schema**: imports `den.schema.conf`. Structural content from entity type declarations.
-- **isEntity**: true (has structural content from host type options).
-- **Self-provide**: `{ host }: host.aspect` -- resolves the host's named aspect from the registry.
-- **Entity type** (`nix/lib/entities/host.nix`): submodule with `name`, `hostName`, `system`, `class` (nixos/darwin), `aspect`, `users`, `instantiate`, `intoAttr`, `mainModule`. Imports `den.schema.host`.
-- **Policies**: `host-to-users` fans out to each user via `resolve.shared`.
-
-### 6.2 user
-
-- **Schema**: imports `den.schema.conf`. Structural content from entity type declarations.
-- **isEntity**: true.
-- **Self-provide**: `{ user }: user.aspect` -- resolves the user's named aspect.
-- **Entity type**: submodule with `name`, `userName`, `classes`, `aspect`, `host` (parent ref). Imports `den.schema.user`. Parent host is injected via `_module.args.host`.
-
-### 6.3 home
-
-- **Schema**: imports `den.schema.conf`. Structural content from entity type declarations.
-- **isEntity**: true.
-- **Self-provide**: `{ home }: home.aspect`.
-- **Entity type** (`nix/lib/entities/home.nix`): submodule with `name`, `userName`, `hostName`, `system`, `class` (homeManager), `aspect`, `pkgs`, `instantiate`, `intoAttr`, `mainModule`. Supports `user@host` naming convention for host-bound homes. Imports `den.schema.home`.
-
-### 6.4 flake
-
-- **Schema**: empty body, registered by `flake-schema.nix`.
-- **isEntity**: false (no structural content).
-- **Self-provide**: none (not in `schemaEntityKinds`).
-- **Purpose**: root entity kind for the flake-level pipeline. Policies on `den.schema.flake` fan out to `flake-system`.
-
-### 6.5 flake-system
-
-- **Schema**: empty body, registered by `flake-schema.nix`.
-- **isEntity**: false.
-- **Self-provide**: none.
-- **Purpose**: per-system scope. Carries `{ system }` context. Policies fan out to OS outputs (`policy.instantiate`), HM outputs, and per-output routes (`policy.route`).
-
-### 6.6 conf
-
-- **Schema**: empty body. Declared in `options.nix`.
-- **isEntity**: always false (hardcoded exclusion: `kind != "conf"`).
-- **Purpose**: shared base module imported by host, user, and home schema entries. Not an entity kind -- a configuration mixin.
-
-### 6.7 default
-
-- **Schema**: empty body, registered by `flake-schema.nix`.
-- **isEntity**: false.
-- **Self-provide**: special-cased in `resolveEntity` -- includes `[ den.default ]` if defined.
-- **Purpose**: global default aspect applied to all entity kinds via schema includes. The `resolveEntityHandler` strips `den.default` from child entities to prevent duplicate resolution.
-
-### 6.8 Custom Entity Kinds
-
-Any module can register new entity kinds by setting `den.schema.<name>`. If the entry has structural content (non-empty module body beyond includes/policies), it becomes a full entity kind with `isEntity = true`, self-provide, and pipeline participation. If the entry is empty, it is a routing kind that exists only for policy dispatch targeting.
-
----
-
-## 7. Key Code Locations
+## Key Files
 
 | File | Role |
-|------|------|
-| `modules/options.nix` | `den.schema`, `den.classes`, `den.hosts`, `den.homes` option declarations; `schemaEntryType` with entity gating and `resolvedCtx` injection |
-| `nix/lib/resolve-entity.nix` | `resolveEntity` function: self-provide, schema includes, scope handlers |
-| `nix/lib/schema-util.nix` | `schemaEntityKinds` (isEntity filter), `schemaArgKinds` (for class-module warnings) |
-| `nix/lib/entities/host.nix` | Host entity type with users submodule |
-| `nix/lib/entities/home.nix` | Home entity type with host/user resolution |
-| `nix/lib/aspects/fx/handlers/resolve-schema-entity.nix` | `resolve-schema-entity` effect: scope push/walk/pop |
-| `nix/lib/aspects/fx/pipeline.nix` | `resolveEntityHandler` (strips den.default), `mkScopeId`, `defaultHandlers`, `defaultState` |
-| `nix/lib/aspects/fx/aspect.nix` | `resolveChildren`, `installPolicies`, `compileStatic`, `aspectToEffect` |
-| `nix/lib/aspects/fx/key-classification.nix` | `classifyKeys`, `structuralKeysSet` |
-| `nix/lib/aspects/fx/include-emit.nix` | `emitSelfProvide`, `emitIncludes`, `emitAspectPolicies` |
-| `modules/aspect-schema.nix` | Dynamic class collection from aspects |
-| `modules/context/flake-schema.nix` | Flake/flake-system/default schema registration |
-| `modules/aspects/defaults.nix` | `den.default` option and schema include injection |
-| `modules/policies/core.nix` | `host-to-users` policy |
-| `modules/policies/flake.nix` | Flake output policies and flake output class registration |
-| `nix/lib/policy-effects.nix` | Typed policy effect constructors |
+|---|---|
+| `modules/options.nix` | `den.schema` option, `schemaEntryType` merge with entity gating, injected options |
+| `nix/lib/resolve-entity.nix` | Entity resolution: self-provide, schema includes, scope handlers, derived bindings |
+| `nix/lib/schema-util.nix` | `schemaEntityKinds` computation (isEntity filter) |
+| `nix/lib/entities/host.nix` | Host entity type definition |
+| `nix/lib/entities/home.nix` | Home entity type definition |
+| `nix/lib/aspects/fx/handlers/resolve-schema-entity.nix` | Resolution lifecycle: push-scope, resolve, drain, propagate, restore |
+| `modules/policies/core.nix` | `host-to-users` traversal policy |
+| `modules/policies/flake.nix` | Flake topology policies and output routing |
+| `modules/context/flake-schema.nix` | Flake/flake-system/default routing kind registration |
+| `modules/aspects/defaults.nix` | `den.default` schema include injection |
 
----
-
-## 8. Planned Redesign: Unified Resolve Effects
-
-**Spec:** `design/unified-resolve-effects.md`
-
-### Changes to Entity Resolution
-
-- **Section 4.3** (execution sequence): Steps 8-10 (walk tree, drain deferred, walk deferred results) change:
-  - `aspectToEffect entity` → `fx.send "resolve" { aspect = entity, identity, ctx }`
-  - `drain-deferred` → `fx.send "drain" { ctx = scopedCtx }` (same semantics, renamed)
-  - Deferred walk unchanged (re-resolves satisfiable items via `resolve` effect)
-
-- **Automatic drain:** For simple scope entries (enrichment widen in policy iteration), drain is automatic via `scope-widened` handler + `enterScope` wrapper. Entity resolution retains explicit drain at the precise point in its orchestration (after entity walk, before route propagation).
-
-- **Fan-out copy (copyDeferredToScope):** Unchanged. This is a state setup step (duplicating parent deferred into child scope), not a drain. Remains as direct state mutation in `resolve-schema-entity`.
-
-- **resolve-entity handler:** Unchanged. Still called by `resolve-schema-entity` to look up entity config.
-
-### New Primitive
-
-```nix
-enterScope = handlers: computation:
-  fx.effects.scope.provide handlers (
-    fx.bind (fx.send "scope-widened" { ctx = ctxFromHandlers handlers; }) (
-      _: computation
-    )
-  );
-```
-
-Used by `policy/iterate` for enrichment widen. NOT used by `resolve-schema-entity` (which needs precise drain timing).
+See also: [scope-partitioning.md](scope-partitioning.md) for how entity scopes partition pipeline state, [policy-system.md](policy-system.md) for the full policy dispatch and effect reference.
