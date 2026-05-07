@@ -1,114 +1,109 @@
-# Class Module Wrapping and Collision Policies
+# Class Module Wrapping
 
-**Branch:** `feat/fx-pipeline` (713/713 tests passing)
-**Date:** 2026-05-04 (updated 2026-05-05)
-**Status:** Implemented
+**Branch:** `feat/fx-pipeline` (753/753 tests passing)
+**Status:** Stable reference
 
-## 1. The Problem
+## 1. Overview
 
-Den aspects emit class modules (NixOS, darwin, homeManager) that are consumed by their respective module systems. These module systems expect functions of the form `{ config, pkgs, lib, ... }: { ... }` where args come from `_module.args` / `specialArgs`.
+Class module wrapping bridges den's pipeline context (entity bindings like `host`, `user`, `fleet`) and NixOS/darwin/homeManager module systems. `wrapClassModule` inspects a module's `functionArgs`, identifies which args correspond to den context keys, partially applies them, and hands the module system a function that only expects module-system args (`config`, `pkgs`, etc.). Collision policies govern what happens when a den arg name overlaps with a module-system arg.
 
-Den has its own context args -- `host`, `user`, `fleet`, and any schema-defined entity kinds -- that live in the pipeline's scope context (`__scopeHandlers`). The ergonomic form is flat:
+## 2. Module Forms
 
-```nix
-{ name = "foo"; nixos = { host, config, pkgs, ... }: { networking.hostName = host.name; }; }
-```
+`wrapClassModule` dispatches on the shape of its `module` argument:
 
-Without wrapping, the NixOS module system would need to know about `host` via `specialArgs`, coupling den's context model to each class system. `wrapClassModule` bridges this: it detects which function args are den context keys, pre-applies them, and hands the module system a function that only expects module-system args.
+| Form | Example | Handling |
+|------|---------|----------|
+| **Flat function** | `{ host, config, pkgs, ... }: { ... }` | `wrapFunctionModule` -- den args detected and partially applied |
+| **Curried / two-layer** | `{ host }: { config, ... }: { ... }` | First call is full application (all args are den args), returns inner function unchanged |
+| **Functor passthrough** | Non-function attrset without `imports` | Returned unchanged, `wrapped = false` |
+| **Full application** | All args are den args, no module-system args | Called immediately with den args, result is a plain value |
+| **Attrset with imports** | `{ imports = [ fn ]; }` | `wrapImportsModule` -- recurses into imports via `wrapDeferredImports` |
 
-## 2. wrapClassModule
+Dispatch logic in `wrapClassModule`:
+1. If `builtins.isAttrs module && module ? imports` -- attrset-with-imports path
+2. If `!builtins.isFunction module` -- non-function passthrough
+3. Otherwise -- function wrapping path
 
-**File:** `nix/lib/aspects/fx/class-module.nix`
+## 3. Den Arg Detection
 
-### Inputs
-
-```nix
-wrapClassModule {
-  module;        # The raw class module value
-  ctx;           # Den context attrset (reconstructed from scope handlers)
-  aspectPolicy;  # aspect.meta.collisionPolicy or null
-  globalPolicy;  # den.config.classModuleCollisionPolicy or "error"
-}
-```
-
-The `ctx` is reconstructed at emit time via `ctxFromHandlers`, which invokes each scope handler with dummy args to extract the original value. This works for all aspects in the tree because `__scopeHandlers` propagates to children.
-
-### Three code paths
-
-**Path 1: Attrset with `imports` key.** The module is `{ imports = [...]; ... }`. Delegates to `wrapDeferredImports` (section 4). Returns the attrset with wrapped imports, plus a collision validator if any inner function was wrapped and ctx is non-empty.
-
-**Path 2: Non-function.** Returns the module unchanged with `wrapped = false`. Plain attrsets and other non-callable values pass through.
-
-**Path 3: Function.** The main wrapping logic:
-
-1. `builtins.functionArgs module` extracts the full argument pattern.
-2. **Den arg detection:** An arg `k` is a den arg if and only if `ctx ? ${k}`. No hardcoded allowlist -- fully dynamic based on what entities are in scope.
-3. **Missing arg detection:** Args not in ctx are checked against `den.lib.schemaUtil.schemaArgKinds` (all schema-defined entity kind names, excluding `conf`, `aspect`, and `_`-prefixed internal keys). If a missing arg matches a schema kind AND has no default value (`!(allArgs.${k} or false)`), a `lib.warn` fires. This avoids false warnings on module-system args like `config` or `pkgs`.
-
-### The unsatisfied guard
-
-If any schema-matching args are missing without defaults, the function returns:
+Detection uses `builtins.functionArgs` introspection against the scope context:
 
 ```nix
-{ module = warnedModule; wrapped = false; unsatisfied = true; missingArgs = [...]; }
+allArgs = builtins.functionArgs module;
+argNames = builtins.attrNames allArgs;
+denArgNames = builtins.filter (k: ctx ? ${k}) argNames;
 ```
 
-The caller (`wrapCollectedClasses`) checks `unsatisfied` and emits a trace message, skipping the module entirely. This prevents class modules from being delivered to the module system when their required den context was never provided -- typically a misconfiguration where an aspect expects an entity that no policy delivers.
+An arg `k` is a den arg if and only if `ctx ? ${k}`. No hardcoded allowlist -- fully dynamic based on what entities are in scope. The `ctx` attrset is reconstructed at emit time from scope handlers.
 
-### Partial vs full application
+**Missing arg detection:** Args not in ctx are checked against `den.lib.schemaUtil.schemaArgKinds` (all schema-defined entity kind names). If a missing arg matches a schema kind AND has no default value (`!(allArgs.${k} or false)`), a `lib.warn` fires. Module-system args like `config` or `pkgs` never match schema kinds, avoiding false warnings.
 
-When den args are found:
+## 4. Partial Application
 
-- **Full application** (`remainingArgs == {}`): All args are den args. The module is called immediately: `warnedModule denArgs`. Result is a plain value, `wrapped = true`.
-- **Partial application** (`remainingArgs != {}`): Some args are den args, others are module-system args. A wrapper function is created:
+Two cases based on whether non-den args remain:
+
+**Full application** (`effectiveRemainingArgs == {}`): Every arg is a den arg. The module is called immediately:
+
+```nix
+{ module = warnedModule denArgs; wrapped = true; }
+```
+
+**Wrapper case** (`effectiveRemainingArgs != {}`): A wrapper function is created that merges den args with module-system args at call time:
 
 ```nix
 wrapper = moduleArgs: warnedModule (classWinsDen // moduleArgs // denWinsDen);
 ```
 
-The merge order implements collision policy at call time:
+The merge order implements collision policy:
 - `classWinsDen` (den args with `class-wins` policy) goes first, then `moduleArgs` shadows them
 - `denWinsDen` (den args with `den-wins` or `error` policy) goes last, shadowing `moduleArgs`
 
-The wrapper is tagged with `lib.setFunctionArgs wrapper advertisedArgs` where `advertisedArgs` includes both remaining module-system args AND den arg names. Den args are advertised so NixOS passes thunks for them (which are then lazily shadowed by den values without forcing evaluation). Without advertising, NixOS would not pass them at all, preventing collision detection.
+The wrapper is tagged with `lib.setFunctionArgs wrapper advertisedArgs` where `advertisedArgs` includes both remaining module-system args AND den arg names. Den args are advertised so NixOS passes thunks for them via `_module.args`, enabling collision detection without forcing evaluation.
 
-### Collision validator
+**Config thunk handling:** When pipe args contain `__configThunk` markers, the wrapper resolves them using the `evalModules` fixpoint config. This breaks the circular dependency between `assemblePipes` and the module system. The presence of config thunks forces `config` into `effectiveRemainingArgs`, ensuring the wrapper path is taken even if no other module-system args exist.
 
-When partial application occurs, a separate `validator` function is returned alongside the wrapped module. This validator:
+## 5. Collision Detection
 
-- Advertises `remainingArgs // { config = true; }` (module-system args + config)
-- At eval time, probes `moduleArgs.config._module.args` for each den arg name
-- If a collision is detected, applies the resolved collision policy (error/warn)
-- Returns `{ warnings = [...]; }` as a NixOS module
-
-The validator is emitted as a separate module (not merged into the wrapper) so that collision detection happens through the module system's standard warning machinery.
-
-## 3. Collision Policies
-
-### Three-level resolution
+### Three policies at three levels
 
 `resolveCollisionPolicy { ctx, aspectPolicy, globalPolicy } name` returns the policy for a specific arg name. First match wins:
 
 | Level | Source | Scope |
 |-------|--------|-------|
-| Aspect | `aspect.meta.collisionPolicy` | All class modules in that aspect (single enum, not per-field) |
-| Entity (instance) | `ctx.${name}.collisionPolicy` | Per-entity instance (e.g., `pipelineOnly` tagged values) |
-| Entity (schema) | `ctx.__collisionPolicies.${name}` | Schema-level policy from `den.schema.<kind>.collisionPolicy` |
+| Aspect | `aspect.meta.collisionPolicy` | All class modules in that aspect (single enum) |
+| Entity instance | `ctx.${name}.collisionPolicy` | Per-entity instance |
+| Entity schema | `ctx.__collisionPolicies.${name}` | Schema-level, from `den.schema.<kind>.collisionPolicy` |
 | Global | `den.config.classModuleCollisionPolicy` | Entire flake, default `"error"` |
 
-**Implementation note:** The schema-level policy is captured eagerly in `resolveEntity` (from `den.schema.<kind>.collisionPolicy`) and stored in `ctx.__collisionPolicies` rather than read from the live entity config. This avoids circular evaluation: `wrapClassModule` runs post-pipeline, and accessing the live schema config would cycle through `den.schema.<kind>.resolved` → pipeline → `wrapClassModule`.
+The schema-level policy is captured eagerly in `resolveEntity` and stored in `ctx.__collisionPolicies` to avoid circular evaluation through the module system.
 
 ### Policy values
 
-- **`"error"`** (default): Throw on collision. Forces the user to resolve the ambiguity.
-- **`"class-wins"`**: Module-system value wins. Den value is dropped. Warning emitted.
-- **`"den-wins"`**: Den value wins. Module-system value is shadowed. Warning emitted.
+- **`"error"`** (default): Throw on collision.
+- **`"class-wins"`**: Module-system value wins. Den value dropped. Warning emitted.
+- **`"den-wins"`**: Den value wins. Module-system value shadowed. Warning emitted.
+
+### mkCollisionValidator
+
+When partial application occurs, a separate `validator` module is returned alongside the wrapped module:
+
+```nix
+mkCollisionValidator = policy: denArgNames: moduleArgs:
+```
+
+At eval time, the validator probes `moduleArgs.config._module.args` for each den arg name using `builtins.tryEval` + `builtins.seq` to safely detect presence without forcing thunks. If a collision is found, it applies the resolved policy and returns `{ warnings = [...]; }` as a NixOS module.
+
+The validator is emitted as a separate module so collision detection flows through the module system's standard warning machinery.
+
+## 6. Enrichment & pipelineOnly
+
+### Pipeline-injected args
+
+Batteries like `den.provides.flake-scope` inject `lib`, `inputs`, and `den` into pipeline context. These are useful for parametric aspect resolution but should yield to the module system's own values in class modules.
 
 ### pipelineOnly semantics
 
-**File:** `nix/lib/policy-effects.nix`
-
-`pipelineOnly` is a convenience wrapper that tags a value with `collisionPolicy = "class-wins"`:
+`pipelineOnly` tags a value with `collisionPolicy = "class-wins"`:
 
 ```nix
 pipelineOnly = value:
@@ -118,33 +113,47 @@ pipelineOnly = value:
     { __functor = _: value; collisionPolicy = "class-wins"; };
 ```
 
-This is used by batteries like `den.provides.flake-scope` that inject `lib`, `inputs`, and `den` into the pipeline context. These values are useful for parametric aspect resolution but should silently yield to the module system's own `lib`/`pkgs` when they reach class modules. The `collisionPolicy` attribute travels with the entity value through `__ctx` and is read by `resolveCollisionPolicy` at the entity level.
+The `collisionPolicy` attribute travels with the entity value through scope context and is read by `resolveCollisionPolicy` at the entity instance level.
 
-Non-attrset values are wrapped in a `__functor` attrset to carry the `collisionPolicy` attribute alongside the callable value.
-
-## 4. Deferred-import wrapping
-
-**Function:** `wrapDeferredImports` in `class-module.nix`
-
-Class modules may arrive as `{ imports = [fn]; }` -- an attrset wrapping one or more module functions in an imports list. This pattern appears with deferred imports and `aspectContentType` unwrapping.
-
-`wrapDeferredImports` recursively descends the imports tree:
-
-1. If an element is a **function**: wrap it via `wrapClassModule` (recursive call with same ctx/policies).
-2. If an element is an **attrset with `imports`**: recurse into its imports list.
-3. Otherwise: pass through unchanged.
-
-Returns `{ wrapped = bool; imports = [...]; }` where `wrapped` is true if any inner function was wrapped. The parent `wrapClassModule` call uses this to decide whether to attach a collision validator.
-
-## 5. Post-pipeline wrapping via wrapCollectedClasses
+### stripEnrichmentArgs
 
 **File:** `nix/lib/aspects/fx/wrap-classes.nix`
 
-Class module wrapping is a **two-phase** process:
+After wrapping, `stripEnrichmentArgs` removes enrichment-only keys from the module's advertised `functionArgs`. Without this, NixOS probes `_module.args.${name}` for every advertised arg and crashes when the key doesn't exist.
 
-**Phase 1 (emit time):** `emitClasses` in `aspect.nix` sends raw `emit-class` effects with `__rawEntry = true`. The module, ctx, and policy args are captured but wrapping is deferred.
+Two modes:
+- **Wrapped modules:** Strip enrichment-only keys (those injected by den scope context but not in the wrapper's `advertisedArgs`)
+- **Unwrapped modules:** Strip args with defaults that aren't in ctx (unknown to both den and NixOS)
 
-**Phase 2 (post-pipeline):** After the pipeline completes, `fxResolve` in `pipeline.nix` calls `wrapCollectedClasses` per scope:
+Keys listed in the wrapper's `advertisedArgs` are preserved -- stripping them would prevent collision detection.
+
+## 7. Deferred Imports
+
+**Function:** `wrapDeferredImports` in `class-module.nix`
+
+Class modules may arrive as `{ imports = [fn]; }`. `wrapDeferredImports` recursively descends the imports tree:
+
+1. **Function element:** Wrap via `wrapClassModule` (recursive call with same ctx/policies)
+2. **Attrset with `imports`:** Recurse into its imports list
+3. **Otherwise:** Pass through unchanged
+
+Returns `{ wrapped = bool; imports = [...]; }` where `wrapped` is true if any inner function was wrapped. The parent call uses this to decide whether to attach a collision validator.
+
+## 8. Unsatisfied Guard
+
+If any schema-matching args are missing without defaults, `wrapFunctionModule` returns:
+
+```nix
+{ module = warnedModule; wrapped = false; unsatisfied = true; missingArgs = [...]; }
+```
+
+The caller (`processEntry` in `wrapCollectedClasses`) checks `result.unsatisfied` and returns an empty list `[]`, silently dropping the module. This prevents class modules from reaching the module system when their required den context was never provided -- typically a misconfiguration where an aspect expects an entity kind that no policy delivers.
+
+## 9. Post-Pipeline Wrapping
+
+**Function:** `wrapCollectedClasses` in `nix/lib/aspects/fx/wrap-classes.nix`
+
+After the pipeline completes, `fxResolve` calls `wrapCollectedClasses` per scope with scope-specific enriched context:
 
 ```nix
 wrappedPerScope = lib.mapAttrs (scopeId: scopeClasses:
@@ -153,87 +162,40 @@ wrappedPerScope = lib.mapAttrs (scopeId: scopeClasses:
 ) scopedClassImportsRaw;
 ```
 
-Each scope gets its own enriched context from `scopeContexts` -- a state field populated by `resolve-schema-entity` and `policy-dispatch` as entities are resolved. This means a class module emitted in a host scope gets host-specific context (with `isNixos`, `isDarwin`, etc.), while the same module in a user scope gets user-specific context.
+### processEntry pipeline
 
-### wrapCollectedClasses processing per entry
+For each raw entry (`__rawEntry = true`):
 
-For each entry in the class imports:
+1. **Pipe targeting:** `applyPipeTargeting` applies per-aspect pipe overrides from `ctx.__pipeTargeted`
+2. **Merge enrichment:** `mergeEnrichment` adds scope-context keys not already in the entry's emit-time ctx, preserving entity bindings from the original scope
+3. **Wrap:** Calls `wrapClassModule` with enriched ctx
+4. **Strip enrichment args:** Removes enrichment-only keys from advertised `functionArgs`
+5. **Compute identity:** Determines anonymous vs named, strips ctxId suffix for non-context-dependent modules
+6. **Module system wrapping:** Anonymous modules get `lib.setDefaultModuleLocation`; named modules get `{ key = loc; _file = loc; imports = [module]; }` for NixOS key-based dedup
+7. **Validator attachment:** If `wrapClassModule` returned a `validator`, it's wrapped as a separate module at `${class}@${identity}/<collision-validator>`
+8. **Unsatisfied check:** If `result.unsatisfied`, returns `[]` (module dropped)
 
-1. **Skip non-raw entries:** Legacy or already-wrapped entries pass through unchanged.
-2. **Merge enrichment:** `mergeEnrichment` adds scope-context keys that aren't already in the entry's emit-time ctx. This preserves entity bindings from the original scope while adding enrichment args.
-3. **Wrap:** Calls `wrapClassModule` with the enriched ctx.
-4. **Strip enrichment args:** `stripEnrichmentArgs` removes enrichment-only keys from the module's advertised `functionArgs`. Without this, NixOS would probe `_module.args` for keys that don't exist and crash. Keys listed in the wrapper's `advertisedArgs` (den args intentionally advertised for collision detection) are preserved — stripping them would prevent NixOS from passing `_module.args` values needed for `class-wins` policy.
-5. **Compute identity:** `computeModuleIdentity` determines whether the module is anonymous and computes a final identity. Context-dependent modules keep the full identity (with ctxId); non-context-dependent modules strip the ctxId suffix.
-6. **Wrap for module system:** `wrapModule` applies location and key-based dedup:
-   - Anonymous modules: `lib.setDefaultModuleLocation` (location only, no key dedup)
-   - Named modules: `{ key = loc; _file = loc; imports = [module]; }` (key enables NixOS dedup)
-7. **Attach validator:** If `wrapClassModule` returned a `validator`, `buildValidatorModule` wraps it with `setFunctionArgs` and `setDefaultModuleLocation` at `${class}@${identity}/<collision-validator>`.
-8. **Unsatisfied check:** If `result.unsatisfied` is true, the module is skipped with a trace message.
+### Cross-scope dedup
 
-## 6. emit-class handler
+Module identity keys follow the pattern `${class}@${identity}`. Named modules use NixOS key-based dedup: if the same key appears in multiple scopes, the module system merges them. Context-dependent modules retain their full identity (with ctxId suffix), so different scope contexts produce distinct keys.
 
-**File:** `nix/lib/aspects/fx/handlers/class-collector.nix`
+## 10. Invariants
 
-The `emit-class` handler runs during pipeline evaluation (Phase 1) and collects class modules into scope-partitioned state.
+- **Den args stripped from advertised signature after wrapping.** `stripEnrichmentArgs` ensures the final module only advertises args the module system can satisfy.
+- **Collision policy cascade order.** Aspect > entity instance > entity schema > global. First match wins, no fallthrough.
+- **Unsatisfied = silent drop.** Modules with missing required den args are dropped with a `lib.warn`, never delivered to the module system.
+- **Enrichment keys never overwrite entity bindings.** `mergeEnrichment` only adds keys not already present in the entry's emit-time ctx.
+- **Config thunks force wrapper path.** Pipe args with `__configThunk` markers add `config` to remaining args, ensuring the module goes through partial application even if all other args are den args.
 
-### Scope-partitioned collection
+## 11. Key Files
 
-State field `scopedClassImports` is an attrset keyed by scope ID, each containing an attrset keyed by class name, each containing a list of module entries:
+| File | Contents |
+|------|----------|
+| `nix/lib/aspects/fx/class-module.nix` | `wrapClassModule`, `wrapFunctionModule`, `wrapImportsModule`, `wrapDeferredImports`, `mkCollisionValidator`, `resolveCollisionPolicy` |
+| `nix/lib/aspects/fx/wrap-classes.nix` | `wrapCollectedClasses`, `processEntry`, `stripEnrichmentArgs`, `mergeEnrichment`, `computeModuleIdentity`, `wrapModule`, `buildValidatorModule` |
+| `nix/lib/aspects/fx/aspect.nix` | `emitClasses` -- emits raw `emit-class` effects during aspect compilation |
+| `nix/lib/aspects/fx/handlers/class-collector.nix` | `emit-class` handler -- scope-partitioned collection with dedup |
 
-```
-scopedClassImports.${scopeId}.${className} = [ entry1, entry2, ... ]
-```
-
-The current scope comes from `state.currentScope`, set by the entity resolver when entering a new scope.
-
-### scopedEmittedLocs dedup
-
-State field `scopedEmittedLocs` tracks which `loc` strings have been emitted per scope. Before adding a module:
-
-```nix
-loc = "${param.class}@${baseIdentity}";
-alreadyEmitted = scopeLocs ? ${loc};
-```
-
-If `alreadyEmitted` is true, the handler returns `state` unchanged -- the duplicate is silently dropped.
-
-### Module identity/location computation
-
-**Raw entries** (`__rawEntry = true`, the current standard path): The handler stores the full `param` attrset plus `__loc` for dedup. Identity computation is deferred to post-pipeline wrapping (`wrapCollectedClasses`).
-
-For raw entries, `baseIdentity` always equals `nodeIdentity` (full identity including ctxId). This is conservative -- post-pipeline wrapping may relax it if the module turns out not to be context-dependent, but the collector cannot know this at emit time.
-
-**Legacy entries** (non-raw, preserved for backward compatibility): The handler constructs the module location wrapper inline:
-- Anonymous modules: `lib.setDefaultModuleLocation loc param.module`
-- Named modules: `{ key = loc; _file = loc; imports = [param.module]; }`
-
-### Thunk wrapping
-
-All growing state fields (`scopedClassImports`, `scopedEmittedLocs`, etc.) are wrapped as thunks (`_: value`) so the trampoline's `deepSeq` doesn't re-materialize accumulated lists at every step. Access requires `(state.field or (_: default)) null`.
-
-## 7. emitClasses in aspect.nix
-
-**Function:** `emitClasses aspect classKeys nodeIdentity`
-
-Called from `compileStatic` for each aspect node. For every class key:
-
-1. Unwraps `aspectContentType` wrappers via `contentUtil.unwrapContentValuesList` to recover raw module values. Lists are processed per-element; bare values become singletons.
-2. For multi-element lists, appends `[${idx}]` to the identity for per-element dedup.
-3. Sends `emit-class` effect with:
-   - `class`: the class key name (e.g., `"nixos"`, `"homeManager"`)
-   - `identity`: the aspect's node identity (path key)
-   - `module`: the raw module value
-   - `ctx`, `aspectPolicy`, `globalPolicy`: for deferred wrapping
-   - `__rawEntry = true`: marks for post-pipeline wrapping
-   - `isContextDependent`: computed from `__parametricResolvedArgs` (whether any resolved parametric args match ctx keys) and `meta.contextDependent`
-
-## 8. Future: Trait args
-
-Traits are not yet reimplemented on `feat/fx-pipeline`, but the design accommodates them. When traits land:
-
-- Each scope will define a `_den.traits` option in the module system, populated from `scopedTraits` state
-- Trait names will become additional den context args available via `__scopeHandlers`
-- `wrapClassModule` will detect trait args via the same `ctx ? ${k}` check -- no special-casing needed
-- A class module like `{ host, myTrait, config, ... }: ...` will have both `host` and `myTrait` pre-applied from the scope context
-- The `_den.traits` thunk pattern (evaluated lazily within the module system) allows trait values to depend on other module system config without circular evaluation
-- Collision policy applies identically: if a trait name collides with a module-system arg, the three-level resolution determines the outcome
+**Cross-references:**
+- [aspect-compilation.md](aspect-compilation.md) -- when wrapping occurs in the compilation pipeline
+- [scope-partitioning.md](scope-partitioning.md) -- per-scope context construction and scope handler propagation
