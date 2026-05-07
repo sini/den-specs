@@ -253,17 +253,37 @@ mkEntityDriver = kind: entitiesS: compS:
   );
 
 # Schema-driven driver chain construction
-# Evaluates schema-level policies to discover nesting order:
-#   flake → fleet → host → user
-# Each level becomes a driver in the Cycle composition
+# Nesting order is implicit in the policy wiring:
+#   den.schema.flake.includes policies emit resolve.to "fleet"
+#   den.schema.fleet.includes policies emit resolve.to "host"
+#   den.schema.host.includes policies emit resolve.to "user" (via host-to-users)
+# Evaluate schema-level policies at definition time to discover this chain.
 buildDriverChain = schema: topology:
   let
-    levels = discoverNestingOrder schema;  # from schema includes → resolve.to effects
+    levels = discoverNestingOrder schema;  # walk schema includes → extract resolve.to targets
     drivers = map (level:
       mkEntityDriver level.kind (entitiesFor level topology)
     ) levels;
   in
   composeDrivers drivers;  # nest: outerD (innerD compS)
+```
+
+**Nesting order discovery:** Each `den.schema.<kind>.includes` contains policies that produce `resolve.to` effects targeting child entity kinds. Evaluating these policies at definition time (not resolution time) reveals the nesting chain. This is a one-time evaluation of schema-level policies — not aspect-level, not runtime.
+
+**Entity vs routing kinds:** Entity kinds (`isEntity = true`: host, user, home) have structural module content and get self-provide (aspect lookup). Routing kinds (`isEntity = false`: fleet, flake-system) exist purely to organize topology. Routing kinds are transparent to `pipe.collect` entity-kind filtering — they do NOT appear in `entityKinds` tags.
+
+**entityDerivedBindings:** Some entities carry references to related entities (e.g., a home entity has `host` and `user` attributes from its type definition). The driver adds these as additional bindings in `ctxD`:
+
+```nix
+mkEntityDriver = kind: entitiesS: compS:
+  entitiesS.flatMap (entity:
+    let
+      derivedBindings = filterAttrs (k: v:
+        k != kind && elem k schemaEntityKinds && isAttrs v && v != null
+      ) entity;
+    in
+    ctxD ({ ${kind} = entity; } // derivedBindings) compS
+  );
 ```
 
 Topology materialization (building host/user/fleet lists from declarations) reuses Ned's pattern — `builtins.foldl'` over the topology attrset, merging duplicates, inferring class from system.
@@ -292,6 +312,8 @@ dispatchD = policiesS: compS:
 ```
 
 **Late dispatch is absent by design.** The Cycle fixed-point makes all policies visible to all entities simultaneously. Policies are a shared source stream, not sequential registrations.
+
+**`policy.include` → stream flatMap.** When a policy returns `policy.include someAspect`, the included aspect becomes a new element in the aspect stream. `processEffects` extracts include effects and feeds them through `expandAspect` — the same flatMap used for regular includes. The included aspect and its entire include tree get resolved in the current scope context.
 
 **Constraint operators:**
 
@@ -324,34 +346,97 @@ expandChildren = seen: aspect:
 
 `classifyKeys` splits an aspect's top-level keys into class keys, pipe keys, and nested keys — same logic as today but without the handler dispatch (~35 lines).
 
-### Layer 4: Pipes (~70 lines)
+### Layer 4: Pipes (~130 lines)
 
-Each `pipe.*` operation maps directly to a stream combinator:
+#### Pipe element tagging
+
+Every pipe emission carries scope metadata so that `pipe.collect` can filter correctly:
+
+```nix
+# When an aspect emits a pipe value, tag it with scope context
+tagPipeEntry = { scopeId, parentScopeId, entityKinds, pipeName, value, aspectId }
+```
+
+- `scopeId` — canonical scope identity (e.g., `"host=igloo"`)
+- `parentScopeId` — parent scope's identity (e.g., `"fleet=fleet"` or root)
+- `entityKinds` — list of entity kinds present in this scope (e.g., `["host"]` or `["host" "user"]`)
+- `pipeName` — which pipe this entry belongs to
+- `value` — the actual data
+- `aspectId` — identity of the emitting aspect (for `pipe.to` targeting)
+
+Tags are produced by `emitAllClasses` during class/pipe routing. The scope context (scopeId, parentScopeId, entityKinds) is available from `ctxD` — each topology driver annotates its scope level.
+
+#### Transform stages
 
 ```nix
 pipeOps = {
-  filter = pred: dataS: dataS.filter pred;
-  transform = f: dataS: dataS.map f;
-  fold = f: init: dataS: st (builtins.foldl' f init dataS.toList);
-  append = val: dataS: dataS (st val);
-  for = f: dataS: st (f dataS.toList);
-
-  collect = pred: dataS: ctx:
-    # Sibling data comes from the Cycle source — all entities' pipe emissions
-    # Filter by predicate, exclude self
-    allPipeDataS.filter (e: pred e.ctx && e.ctx != ctx);
-
-  withProvenance = dataS: ctx:
-    dataS.map (v: { value = v; source = ctx; });
-
-  to = targets: dataS:
-    dataS.filter (e: elem e.aspectId targets);
+  filter = pred: entries: entries.filter (e: pred e.value);
+  transform = f: entries: entries.map (e: e // { value = f e.value; });
+  fold = f: init: entries: st [{ value = builtins.foldl' f init (map (e: e.value) entries.toList); }];
+  append = val: entries: entries (st [{ value = val; }]);
+  for = f: entries: st [{ value = f (map (e: e.value) entries.toList); }];
 };
 ```
 
-`pipe.collect` leverages the Cycle fixed-point: all entities' pipe emissions are available as a shared source stream. The predicate filters by context shape, and self-exclusion is a simple identity check. No scope tree walk needed.
+#### pipe.collect — the collect operator
 
-`pipe.expose` (child → parent) is implicit: user-scoped emissions are sub-streams within host-scoped streams. When the host stream materializes, user data is already there.
+`pipe.collect` uses the Cycle fixed-point source containing all entities' pipe emissions. The operator performs three checks per candidate entry:
+
+```nix
+collect = predicate: currentScopeId: currentParentScopeId: allPipeEntriesS:
+  let
+    predArgs = builtins.functionArgs predicate;
+    requiredArgs = builtins.filter (k: !predArgs.${k}) (builtins.attrNames predArgs);
+    predEntityArgs = builtins.filter (k: builtins.elem k schemaEntityKinds) requiredArgs;
+  in
+  allPipeEntriesS.filter (entry:
+    # 1. Self-exclusion: skip own scope
+    entry.scopeId != currentScopeId
+    # 2. Sibling check: same parent scope
+    && entry.parentScopeId == currentParentScopeId
+    # 3. Entity-kind filtering (bidirectional):
+    #    - entry must have all entity kinds the predicate requires (via hasRequired below)
+    #    - entry must NOT have extra entity kinds the predicate doesn't mention
+    && let
+      extraEntityKinds = builtins.filter (k: !builtins.elem k predEntityArgs) entry.entityKinds;
+    in extraEntityKinds == []
+    # 4. Predicate satisfaction: call the predicate with entry's context
+    && predicate entry.ctx
+  );
+```
+
+The three-check pattern replicates Den's current `findMatchingSiblings` exactly:
+1. **Self-exclusion** — `scopeId` inequality
+2. **Sibling identification** — shared `parentScopeId`
+3. **Entity-kind filtering** — bidirectional: predicate `{ host, ... }:` requires `host` AND rejects scopes with extra entity kinds like `user`
+
+Routing kinds (fleet, flake-system) have `isEntity = false` and do NOT appear in `entityKinds`. They are transparent to the filter — a host scope nested under fleet has `entityKinds = ["host"]`, not `["fleet" "host"]`.
+
+#### Cycle timing
+
+The pipe.collect operator reads from the Cycle source `allPipeEntriesS`. This source contains entries from ALL entity scopes — populated by the Cycle fixed-point. The timing works because:
+
+1. Stream construction is lazy — building the filter/map chain doesn't force evaluation
+2. The Cycle fixed-point ties `allPipeEntriesS` to the output of all topology drivers
+3. Evaluation only happens at `.toList` (terminal), at which point all scopes have emitted their entries
+
+The collect operator is a pure filter on a lazy stream — no synchronization point needed beyond what the Cycle already provides.
+
+#### Other pipe operations
+
+**`pipe.expose`** (child → parent) is implicit: user-scoped emissions are sub-streams within host-scoped streams. When the host stream materializes, user data is already there.
+
+**`pipe.withProvenance`:**
+```nix
+withProvenance = entries: entries.map (e: { value = e.value; source = e.ctx; });
+```
+
+**`pipe.to`** (targeted delivery):
+```nix
+to = targetAspects: entries: entries.filter (e: builtins.elem e.aspectId targetAspects);
+```
+
+**Config thunks** — pipe values that are `{ config, ... }:` functions. These flow through the Cycle as opaque thunks. Resolution happens lazily when `config` is available from `nixosSystem`. See "Config thunk laziness boundary" below.
 
 ### Layer 5: Forwards (~100 lines)
 
@@ -401,14 +486,13 @@ darwinS = allModulesS.filter (e: e.class == "darwin").map (e: e.module);
 
 Dynamic — no upfront class registry needed for routing. New user-defined classes appear as new tag values.
 
-### Layer 7: Module Integration (~30 lines)
+### Layer 7: Module Integration (~70 lines)
 
 **Single injection path via ctxD.** No collision detection, no enrichment stripping, no dual injection.
 
 Modules that take Den context args (`{ host, user, ... }`) have those args resolved by the effect handler stack before reaching NixOS. The module's NixOS-facing signature only contains NixOS args (`{ config, pkgs, lib, ... }`).
 
 ```nix
-# Simple case: partial application
 wrapModule = ctx: module:
   if !isFunction module then module
   else
@@ -418,7 +502,29 @@ wrapModule = ctx: module:
     else lib.setFunctionArgs (args: module (denArgs // args)) remaining;
 ```
 
-Module `key` and `_file` tagging for NixOS module system dedup (~10 lines). This is the only NixOS compatibility layer needed.
+**Why collision detection is dead:** `remaining` does NOT include Den arg names. The `setFunctionArgs` call uses `remaining` (Den args stripped), so NixOS only sees `{ config, pkgs, lib, ... }` — never `host`, never `user`. There is no second injection path to collide with. The 250-line collision system (`mkCollisionValidator`, `resolveCollisionPolicy`, `classWinsDen`/`denWinsDen` merge ordering) is eliminated.
+
+**Why enrichment stripping is dead:** Enrichment args (`lib`, `inputs`, `den`) are provided at the parametric wrapper level only — the outer `{ host, lib, ... }:` function. They are consumed by `ctxD` before the inner class module is reached. The two-layer form naturally separates them:
+
+```nix
+{ host, lib, ... }:          # ← parametric wrapper: gets pipeline lib via ctxD
+{
+  nixos = { config, lib, ... }:  # ← class module: gets NixOS lib via _module.args
+  { ... };
+}
+```
+
+For flat-form modules (`{ host, config, lib, ... }:`), `wrapModule` strips `host` from `functionArgs` (it's a Den arg). `lib` remains in `remaining` because it's NOT in `ctx` — Den does not inject `lib` into the class-level context. NixOS provides its own `lib` via `_module.args`. No collision, no stripping.
+
+**Module forms handled:**
+- **Attrset** (`{ imports = [...]; config = ...; }`) — passthrough, no wrapping
+- **Flat function** (`{ host, config, ... }: ...`) — partial application, Den args stripped from signature
+- **Two-layer / curried** (`{ host }: { config, ... }: ...`) — outer resolved by ctxD, inner is a standard NixOS module
+- **Functor** (`{ __functor = ...; }`) — passthrough, NixOS handles functors natively
+- **Full application** (`{ host }: ...` with no `...`) — all args are Den args, call directly, return value becomes the module
+- **Attrset with function imports** (`{ imports = [fn]; }`) — recursive descent into imports, wrapping each function found
+
+Module `key` and `_file` tagging for NixOS module system dedup (~10 lines).
 
 ### Layer 8: Options Layer (~200 lines)
 
@@ -539,7 +645,7 @@ Config thunks (pipe values that reference `{ config, ... }`) work through the sa
 | Entity system | ~80 | mkEntityDriver, schema-to-driver, topology materialization |
 | Policy dispatch | ~160 | converge, dispatchD, effect classification, constraints |
 | Aspect resolution | ~200 | normalization, classifyKeys, identity, dedup, tree expansion |
-| Pipes | ~130 | transform stages, collect with predicates, provenance, config thunks |
+| Pipes | ~130 | transform stages, collect with scope tagging + bidirectional entity-kind filter, provenance, config thunks |
 | Forwards | ~110 | adapter functor, forwardItem, forwardTo wiring |
 | Class routing | ~30 | tagged emission, per-class filtering |
 | Module integration | ~70 | wrapModule, key/file tagging, attrset-with-imports handling |
@@ -563,22 +669,22 @@ Den has 713 tests across 8 suites. These test **observable behavior** — given 
 
 ### Porting sequence
 
+See the [Incremental Delivery spec](2026-05-07-den2-incremental-delivery.md) for the detailed 10-phase delivery plan with per-phase test targets and dependency ordering:
+
 ```
-Phase 1: Port the simplest suite first (static aspects, basic topology)
-         Validates: ST, ctxD, hostsT, usersT, class routing, module wrapping
-Phase 2: Port policy suite
-         Validates: dispatchD, converge, enrichment, constraints
-Phase 3: Port pipe/quirk suite
-         Validates: pipe combinators, collect, expose, targeted delivery
-Phase 4: Port forward suite
-         Validates: adapter functor, forwardTo, policy.route
-Phase 5: Port system integration suite
-         Validates: full Cycle, nixosSystem/darwinSystem, cross-host data
-Phase 6: Port remaining suites (parametric, custom entities, edge cases)
-Phase 7: Port diag integration (deferred — separate effort)
+Phase 0: Foundation (ST, ctxD, hostsT, basic class routing)
+Phase 1: Aspect resolution (include trees, dedup)
+Phase 2: Parametric aspects (ctxD function arg resolution)
+Phase 3: Policy dispatch (converge, enrichment, constraints)
+Phase 4: Forwards (adapter functor, forwardTo, policy.route)
+Phase 5: Custom entities (schema-to-driver, namespaces)
+Phase 6: Pipes (pipe.collect via Cycle, transform stages)
+Phase 7: Regressions (deadbugs corpus)
+Phase 8: API changes (compat shims)
+Phase 9: Delete old engine
 ```
 
-Each phase validates a layer of the engine. Failures in phase N indicate bugs in layer N.
+Phases 4 and 5 can run in parallel. Phase 6 depends on Phase 5 (topology defines siblings for pipe.collect).
 
 ## Open Questions
 

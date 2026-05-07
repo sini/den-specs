@@ -24,8 +24,8 @@ Build `resolve2` alongside the current engine. Both coexist in the repo. Tests r
 
 1. **No flag day.** Both engines coexist at every phase. The old engine runs all tests throughout.
 2. **Each phase is testable.** Clear test subsets validate each layer. Failures localize to the layer just added.
-3. **Rollback at any point.** If Phase 4 (pipes) is harder than expected, the old engine still works.
-4. **API changes are separate from engine changes.** Phase 7 changes the surface; Phases 0-6 change internals. Never debug both simultaneously.
+3. **Rollback at any point.** If a phase is harder than expected, the old engine still works.
+4. **API changes are separate from engine changes.** Phase 8 changes the surface; Phases 0-7 change internals. Never debug both simultaneously.
 5. **Reviewable PRs.** Each phase is a self-contained chunk. Phase 0 is ~280 lines.
 6. **Zero regression window.** The old engine handles production. The new engine catches up.
 
@@ -184,6 +184,8 @@ den.aspects.never = { nonexistent, ... }: { nixos.foo = true; };  # silently ski
 
 **Note:** This is the largest test phase because parametric aspects touch everything — class-module partial application alone is 53 tests. Getting this phase right is critical.
 
+**Sub-design:** See [rebuild spec Layer 7](2026-05-07-den2-stream-rebuild.md#layer-7-module-integration-70-lines) for the `wrapModule` implementation, why collision detection is dead (Den args stripped from `functionArgs`), why enrichment stripping is dead (pipeline args stay at wrapper level), and the 6 module forms handled. Of the 18 tests in `class-module-partial-apply.nix`, 10 test partial application (port directly) and 8 test collision detection (become dead code).
+
 ## Phase 3: Policy Dispatch
 
 **Goal:** Policy enrichment convergence, context-dependent dispatch, constraints (exclude/substitute/filter).
@@ -227,46 +229,9 @@ Note: `fx-constraints.nix` has ~21 tests but mixes behavioral constraint semanti
 
 **Test target: ~80 behavioral tests** (cumulative ~429)
 
-## Phase 4: Pipes
+**Sub-design:** See [rebuild spec Layer 2](2026-05-07-den2-stream-rebuild.md#layer-2-policy-dispatch-130-lines) for the `converge` function, `dispatchD` driver, and how `policy.include` maps to stream flatMap (included aspects become new elements in the aspect stream, expanded through `expandAspect`).
 
-**Goal:** Pipe transform stages, cross-host pipe.collect via Cycle fixed-point, pipe.expose, targeted delivery, provenance, config thunks.
-
-**Lines added:** ~130 (pipe combinators, the targeted Cycle fixed-point for pipe data)
-
-**What works after this phase:**
-
-```nix
-den.pipes.firewall = {};
-den.aspects.nginx.firewall = { ports = [ 80 443 ]; };
-den.aspects.networking.nixos = { firewall, ... }: {
-  networking.firewall.allowedTCPPorts = concatMap (f: f.ports) firewall;
-};
-
-den.policies.fleet-backends = { host, ... }:
-  let inherit (den.lib.policy) pipe; in [
-    (pipe.from "http-backends" [
-      (pipe.collect ({ host, ... }: true))
-      pipe.withProvenance
-    ])
-  ];
-```
-
-**Validates:** Local aggregation, pipe.filter/transform/fold/append/for, pipe.collect with predicate + self-exclusion, pipe.expose (child→parent), pipe.to (targeted), pipe.withProvenance, config thunks.
-
-**Test files:**
-
-| File | Tests |
-|------|-------|
-| `pipes.nix` | 8 |
-| `pipe-policy.nix` | 13 |
-| `pipe-scope.nix` | 16 |
-| `provide-to.nix` | 3 |
-
-**Test target: ~40 behavioral tests** (cumulative ~486)
-
-**This is the Cycle phase.** The targeted fixed-point for pipe data cross-referencing is the only genuinely circular part of the architecture. If this works, the hardest architectural question is answered.
-
-## Phase 5: Forwards
+## Phase 4: Forwards
 
 **Goal:** Class-to-class forwarding via stream concat, adapter functor for guards/adaptArgs, forwardTo wiring, policy.route.
 
@@ -303,9 +268,9 @@ den.policies.os-to-host = { host, ... }: [
 | `debug-fwd.nix` | 6 |
 | `dynamic-intopath.nix` | 2 |
 
-**Test target: ~34 behavioral tests** (cumulative ~520)
+**Test target: ~34 behavioral tests** (cumulative ~463)
 
-## Phase 6: Custom Entities, Schema, Namespaces
+## Phase 5: Custom Entities, Schema, Namespaces
 
 **Goal:** Schema-to-driver generation, custom entity kinds (fleet, environment), namespaces, provider system.
 
@@ -342,7 +307,52 @@ ns.my-aspect.nixos.foo = true;
 | `host-aspects.nix` | 10 |
 | `hm-host-isolation.nix` | 2 |
 
-**Test target: ~79 behavioral tests** (cumulative ~599)
+**Test target: ~79 behavioral tests** (cumulative ~542)
+
+**Sub-design:** See [rebuild spec Layer 1](2026-05-07-den2-stream-rebuild.md#layer-1-entity-system-70-lines) for `mkEntityDriver` factory, nesting order discovery from schema policy chains, entity vs routing kind distinction, and `entityDerivedBindings` (how home infers host+user).
+
+## Phase 6: Pipes
+
+**Goal:** Pipe transform stages, cross-host pipe.collect via Cycle fixed-point, pipe.expose, targeted delivery, provenance, config thunks.
+
+**Lines added:** ~130 (pipe combinators, the targeted Cycle fixed-point for pipe data)
+
+**Depends on:** Phase 5 (custom entities) — pipe.collect's sibling definition is determined by the topology driver structure. You need to know what "siblings" means before you can collect from them.
+
+**What works after this phase:**
+
+```nix
+den.pipes.firewall = {};
+den.aspects.nginx.firewall = { ports = [ 80 443 ]; };
+den.aspects.networking.nixos = { firewall, ... }: {
+  networking.firewall.allowedTCPPorts = concatMap (f: f.ports) firewall;
+};
+
+den.policies.fleet-backends = { host, ... }:
+  let inherit (den.lib.policy) pipe; in [
+    (pipe.from "http-backends" [
+      (pipe.collect ({ host, ... }: true))
+      pipe.withProvenance
+    ])
+  ];
+```
+
+**Validates:** Local aggregation, pipe.filter/transform/fold/append/for, pipe.collect with predicate + self-exclusion + entity-kind filtering, pipe.expose (child→parent), pipe.to (targeted), pipe.withProvenance, config thunks.
+
+**Test files:**
+
+| File | Tests |
+|------|-------|
+| `pipes.nix` | 8 |
+| `pipe-policy.nix` | 13 |
+| `pipe-scope.nix` | 16 |
+| `provide-to.nix` | 3 |
+
+**Test target: ~40 behavioral tests** (cumulative ~582)
+
+**This is the Cycle phase.** The targeted fixed-point for pipe data cross-referencing is the only genuinely circular part of the architecture. If this works, the hardest architectural question is answered.
+
+**Sub-design:** See [rebuild spec Layer 4](2026-05-07-den2-stream-rebuild.md#layer-4-pipes-130-lines) for the pipe element tagging schema (`{ scopeId, parentScopeId, entityKinds, pipeName, value, aspectId }`), the three-check collect operator (self-exclusion, sibling identification, bidirectional entity-kind filtering), and the Cycle timing explanation.
 
 ## Phase 7: Regression Corpus + Edge Cases
 
@@ -360,7 +370,7 @@ ns.my-aspect.nixos.foo = true;
 | `pure-eval.nix` | 4 |
 | `ctx-compat.nix` | 4 |
 
-**Test target: ~69 tests** (cumulative ~668)
+**Test target: ~69 tests** (cumulative ~651)
 
 ## Phase 8: API Changes + Compat Shims
 
@@ -388,7 +398,7 @@ den.lib.perHost = f: f;     # identity — ctxD handles context
 den.quirks = den.pipes;     # alias
 ```
 
-**Test target: remaining ~85 tests** (cumulative: all 753 behavioral + new engine tests)
+**Test target: remaining tests** (cumulative: all 753 behavioral + new engine tests)
 
 ## Phase 9: Delete Old Engine
 
@@ -415,7 +425,7 @@ Also deleted: compat shims from Phase 8, `fx-*` internal test files (~214 tests 
 
 **Post-deletion test count:** 753 - 214 (old engine internals) + N (new engine-specific tests) = ~539+ behavioral tests, all passing on the stream engine.
 
-The `fx-*` internal tests are replaced incrementally during Phases 0-6 with stream-engine-specific tests that validate the new internals (ST operations, ctxD scoping, Cycle fixed-point behavior, etc.).
+The `fx-*` internal tests are replaced incrementally during Phases 0-7 with stream-engine-specific tests that validate the new internals (ST operations, ctxD scoping, Cycle fixed-point behavior, etc.).
 
 **Diag subsystem:** The diag subsystem (~3,000 lines, `fx-trace.nix` + `fx-diag-*` = ~19 tests) reads old pipeline state (handler traces, scope contexts). Phase 9 breaks diag. This is accepted — diag is a separate redesign effort using stream tracing (`traceD` driver). Diag tests are excluded from the 753 behavioral target and documented as broken-until-redesigned.
 
@@ -427,16 +437,16 @@ The `fx-*` internal tests are replaced incrementally during Phases 0-6 with stre
 | 1: Aspect resolution | ~150 | 0 | 430 | ~98 | Include trees work |
 | 2: Parametric | ~30 | 0 | 460 | ~113 | `den.lib.parametric` eliminated |
 | 3: Policy dispatch | ~160 | 0 | 620 | ~80 | Enrichment convergence works |
-| 4: Pipes | ~130 | 0 | 750 | ~40 | Cycle fixed-point proven |
-| 5: Forwards | ~110 | 0 | 860 | ~34 | Class routing complete |
-| 6: Custom entities | ~80 | 0 | 940 | ~79 | Full entity system |
+| 4: Forwards | ~110 | 0 | 730 | ~34 | Class routing complete |
+| 5: Custom entities | ~80 | 0 | 810 | ~79 | Full entity system |
+| 6: Pipes | ~130 | 0 | 940 | ~40 | Cycle fixed-point proven |
 | 7: Regressions | ~20 | 0 | 960 | ~69 | Deadbugs pass |
 | 8: API changes | ~50 | 0 | 1,010 | remaining | Feature parity (753) |
 | 9: Delete old engine | 0 | ~5,500 | 1,010 | — | Done |
 
 Per-file test counts are approximate. Run `nix-unit --flake .#tests.<suite>` for exact counts before each phase.
 
-Phases 4, 5, and 6 are independent — they can run in parallel worktrees after Phase 3 lands.
+Phases 4 and 5 are independent — they can run in parallel worktrees after Phase 3 lands. Phase 6 (pipes) must wait for Phase 5 (topology defines what "siblings" means for pipe.collect).
 
 **Final state:** ~1,400 lines of resolution engine (1,010 new + ~390 preserved types/options/identity), down from ~7,300. All behavioral tests passing. 5x reduction achieved incrementally over 10 reviewable PRs.
 
@@ -444,28 +454,28 @@ Phases 4, 5, and 6 are independent — they can run in parallel worktrees after 
 
 ```
 Phase 0 (foundation)
-  ├── Phase 1 (aspect resolution)
-  │     ├── Phase 2 (parametric)
-  │     │     ├── Phase 3 (policy dispatch)
-  │     │     │     ├── Phase 4 (pipes)
-  │     │     │     ├── Phase 5 (forwards)
-  │     │     │     └── Phase 6 (custom entities)
-  │     │     │           └── Phase 7 (regressions)
-  │     │     │                 └── Phase 8 (API changes)
-  │     │     │                       └── Phase 9 (delete old)
+  └── Phase 1 (aspect resolution)
+        └── Phase 2 (parametric)
+              └── Phase 3 (policy dispatch)
+                    ├── Phase 4 (forwards)          ← independent
+                    └── Phase 5 (custom entities)   ← independent
+                          └── Phase 6 (pipes)       ← depends on 5: topology defines siblings
+                                └── Phase 7 (regressions)
+                                      └── Phase 8 (API changes)
+                                            └── Phase 9 (delete old)
 ```
 
-Phases 4, 5, and 6 are independent of each other — they all depend on Phase 3 but can be worked in parallel (separate worktrees).
+Phases 4 and 5 are independent of each other (can run in parallel worktrees after Phase 3). **Phase 6 depends on Phase 5** because pipe.collect's sibling definition is determined by the topology driver structure — you need to know what "siblings" means before you can collect from them.
 
 ## Risk Mitigation
 
 ### "What if a phase is harder than estimated?"
 
-Each phase is additive. The old engine continues running all 753 tests regardless of new engine progress. If Phase 4 (pipes) takes 200 lines instead of 130, the total shifts from ~1,400 to ~1,470 — still a massive reduction.
+Each phase is additive. The old engine continues running all 753 tests regardless of new engine progress. If Phase 6 (pipes) takes 200 lines instead of 130, the total shifts from ~1,400 to ~1,470 — still a massive reduction.
 
 ### "What if the Cycle fixed-point doesn't work for pipes?"
 
-Phase 4 is the architectural crux. If the Cycle approach fails for pipe.collect, we fall back to a lightweight post-resolution coordination pass (Approach C from the migration spec). This adds ~100 lines but is strictly simpler than the current 632-line assemblePipes. Phases 0-3 and 5-6 are unaffected.
+Phase 6 is the architectural crux. If the Cycle approach fails for pipe.collect, we fall back to a lightweight post-resolution coordination pass (Approach C from the migration spec). This adds ~100 lines but is strictly simpler than the current 632-line assemblePipes. Phases 0-5 are unaffected.
 
 ### "What about the fx-* internal tests?"
 
@@ -477,9 +487,9 @@ These test handler internals that won't exist. They're replaced as each phase la
 | 1 | fx-compile-conditional, fx-gate, fx-includeIf | expandAspect tests, dedup tests |
 | 2 | fx-compile-parametric, fx-ctx-*, fx-parametric-meta, fx-regressions | ctxD arg resolution tests |
 | 3 | fx-constraints, fx-dispatch-policies, fx-adapter-integration | converge tests, constraint tests |
-| 4 | fx-scope-effects, fx-scope-widen, fx-iterate-effects, fx-bind-subsystem, fx-coverage | Cycle tests, pipe combinator tests |
-| 5 | fx-compile-forward | adapter functor tests |
-| 6 | fx-full-pipeline, fx-e2e | end-to-end stream tests |
+| 4 | fx-compile-forward | adapter functor tests |
+| 5 | fx-full-pipeline, fx-e2e | end-to-end stream tests |
+| 6 | fx-scope-effects, fx-scope-widen, fx-iterate-effects, fx-bind-subsystem, fx-coverage | Cycle tests, pipe combinator tests |
 
 ### "What about diagnostics?"
 
