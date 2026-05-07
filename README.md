@@ -10,7 +10,7 @@ The result is a pipeline where policy dispatch, context expansion, and entity re
 
 ## Design Specs (Current Architecture)
 
-These describe the pipeline as it exists today (629/629 tests, PR [#475](https://github.com/denful/den/pull/475)). Written from code analysis.
+These describe the pipeline as it exists today (753/753 tests on feat/fx-pipeline). Written from code analysis.
 
 ### Core Pipeline
 
@@ -34,6 +34,13 @@ These describe the pipeline as it exists today (629/629 tests, PR [#475](https:/
 |-----------|------|---------|
 | **Class Module Wrapping** | [design/class-module-wrapping.md](design/class-module-wrapping.md) | `wrapClassModule` enables flat-form class modules by detecting den args via `builtins.functionArgs` and pre-applying them. Three collision policy levels (aspect, entity, global). Post-pipeline `wrapCollectedClasses` wraps per-scope with scope-specific context. |
 
+### Data Flow
+
+| Component | Spec | Summary |
+|-----------|------|---------|
+| **Pipes and Quirks** | [design/pipes-and-quirks.md](design/pipes-and-quirks.md) | Named data channels (`den.quirks`) with producer/consumer pattern. Aspects emit pipe data as keys; class modules consume via function args. Policy-driven transform stages (filter, transform, fold, append, for). Cross-host collection via `pipe.collect`, child-to-parent via `pipe.expose`, targeted delivery via `pipe.to`. |
+| **Effect Vocabulary** | [design/effect-vocabulary.md](design/effect-vocabulary.md) | Complete catalog of all named effects in the fx pipeline with handler locations and semantics. |
+
 ### Visualization
 
 | Component | Spec | Summary |
@@ -52,6 +59,16 @@ These describe the pipeline as it exists today (629/629 tests, PR [#475](https:/
 |-----------|------|---------|
 | **Traits** | [design/traits.md](design/traits.md) | Semantic data channels collected across aspects at pipeline time. `scope.provide` resolves parametric values before collection — no classification needed. Schema registry (`den.traits`) with collection strategies. `{ traitName, ... }:` consumption in discriminators and class modules. ~250 lines estimated, 10x simpler than the deleted implementation. |
 | **Fleet + den.exports** | [design/fleet-and-exports.md](design/fleet-and-exports.md) | Cross-host data via lazy `fleet` attrset of evaluated NixOS configs + `den.exports` freeform option. Replaces the original provide-to mechanism and config-dependent trait values. Uses Nix laziness directly — no pipeline involvement, no custom distribution phase. |
+
+### Proposed: Stream Architecture (Den 2)
+
+Proposed ground-up rebuild of the resolution engine on [Ned](https://github.com/denful/ned)-style stream primitives (ST, ctxD, Cycle.js fixed-point). Replaces the handler-based trampoline with stream composition. ~1,400 lines targeting feature parity with the current ~7,300 line pipeline.
+
+| Document | Summary |
+|----------|---------|
+| **[Stream Architecture Migration](design/stream-architecture-migration.md)** | Concern-by-concern analysis mapping each current subsystem (forwards, policies, pipes, DI, dedup) to stream equivalents. Establishes that Approach A (independent entity resolution + Cycle fixed-point) handles all cross-host features. |
+| **[Den 2: Stream Rebuild](design/den2-stream-rebuild.md)** | Target architecture spec. 8 resolution engine layers, 7 API changes, Cycle structure (linear chain + targeted pipe fixed-point). Pipe.collect sub-design with scope metadata tagging and bidirectional entity-kind filtering. |
+| **[Den 2: Incremental Delivery](design/den2-incremental-delivery.md)** | 10-phase parallel-engines delivery plan. Build resolve2 alongside current engine, port test suites incrementally, delete old engine when all 753 tests pass. Phases 4+5 parallelizable; Phase 6 (pipes) depends on Phase 5 (topology). |
 
 ## Reference Documents
 

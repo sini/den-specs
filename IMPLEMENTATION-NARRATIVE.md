@@ -1,9 +1,9 @@
 # Implementation Narrative: feat/fx-pipeline Branch
 
-**Date:** 2026-05-04
-**Purpose:** Accurate intermediate documentation tracing how the fx-pipeline implementation evolved. Designed to be consumed alongside the consolidated spec (`2026-05-02-fx-pipeline-consolidated.md`) for producing accurate end-state documentation.
+**Date:** 2026-05-07 (updated from 2026-05-04)
+**Purpose:** Accurate documentation tracing how the fx-pipeline implementation evolved and where it is headed. Designed to be consumed alongside the consolidated spec (`2026-05-02-fx-pipeline-consolidated.md`) and the Den 2 stream architecture specs.
 
-**Reading guide:** This document covers the implemented-branch specs chronologically. For each phase, it describes what was designed, what actually shipped, where the design diverged, and what the lasting consequence is. The consolidated spec describes the current end-state; this document explains how we got there and why.
+**Reading guide:** This document covers the implementation arc chronologically. Phases 1-8 describe what was designed, what actually shipped, where the design diverged, and what the lasting consequence is. Phase 9 describes the proposed stream architecture rebuild (Den 2) — not yet implemented.
 
 ---
 
@@ -320,6 +320,9 @@ These decisions, made across multiple phases, are load-bearing in the current ar
 | Scope-partitioned state with `mkScopeId` | 4 | Foundation for entity isolation without sub-pipelines |
 | `den.default` stripping is load-bearing | 5 | Removing it causes 8+ test failures — complementary with filtered root fallback |
 | `installPolicies` via `scope.provide`, not monolithic handler | 5 | The cleanup arc's key insight: use the effect system's primitives, don't reimplement them |
+| Narrow effect decomposition (37 handler files) | 6-7 | Made each concern visible and separable — prerequisite for stream architecture analysis |
+| Pipes as post-pipeline assembly, not inline | 8 | `pipe.collect` needs sibling visibility that DFS walk can't provide — strongest argument for streams |
+| Bidirectional entity-kind filtering in pipe.collect | 8 | Replicated in Den 2 stream spec with scope metadata tagging |
 
 ## Cross-Phase Design Decisions That Were Reversed
 
@@ -335,6 +338,7 @@ These decisions, made across multiple phases, are load-bearing in the current ar
 | `scopeStack`/`scopeChildren`/`scopeProvenance` | 4 | 5 | `scope.provide` lexical scoping eliminates need for explicit stack |
 | `runSubPipeline` combinator | 4 | 5 | Scope partitions + inline resolution |
 | `entityIncludes` per-kind aspect lists | 3 (early) | 3 (late) | `den.schema.X.includes` with direct refs |
+| Handler-based trampoline (entire model) | 1-7 | 9 (proposed) | Stream composition + Cycle fixed-point (Den 2) |
 
 ---
 
@@ -462,43 +466,113 @@ Coupling is explicit through import signatures. Shared state mutation helpers li
 
 ---
 
-## Phase 7: Effect Architecture Redesign (Planned)
+## Phase 7: Effect Architecture Redesign (Implemented)
 
 ### Specs
 
-Three specs define the next architectural evolution:
+Three specs defined the narrow effects decomposition:
 
-1. **`tbd/unified-resolve-effects.md`** — Unified resolution chain: resolve → gate → compile → compile-{forward, conditional, parametric, static}. Bind/defer/drain subsystem. Eliminates resolve-parametric, resolve-aspect, resolve-conditional, emit-forward, defer-include, drain-deferred effects. Adds 14 new narrow effects.
+1. **`tbd/unified-resolve-effects.md`** — Unified resolution chain: resolve → gate → compile → compile-{forward, conditional, parametric, static}. Bind/defer/drain subsystem.
+2. **`tbd/policy-entity-primitives.md`** — Policy iteration and entity resolution as primitive compositions.
+3. **`tbd/emission-pipeline.md`** — Unified emission for classes and traits.
 
-2. **`tbd/policy-entity-primitives.md`** — Policy iteration and entity resolution as primitive compositions. dispatch-policies, record-fired, emit-policy-effects, widen-context effects for the iterate loop. push-scope, restore-scope, propagate-routes effects for entity resolution.
+### What actually shipped
 
-3. **`tbd/emission-pipeline.md`** — Unified emission for classes and traits. Shared emit-content handler (unwrap → iterate → dispatch). Lazy trait collection (thunks resolve via Nix native laziness). Class-module wrapping decomposed into detectDenArgs, checkMissingArgs, applyDenArgs, buildValidator.
+The effect decomposition landed across multiple commits. The 35+ handler files in `fx/handlers/` are the result — each handler ≤70 lines, shape dispatch via `compile` router, bind/defer/drain subsystem self-contained. The architecture described in Phase 6's directory structure is the implemented version of these specs.
 
-### Design principles
+### Lasting consequence
 
-- **Every handler ≤15 lines.** No multi-shape logic in any handler.
-- **No branching in handlers.** Shape dispatch is a pure router (`compile`). Each compile-* handler knows exactly what it received.
-- **Identity + ctx flow as data.** Computed once by the walker, never recomputed.
-- **Bind subsystem is self-contained.** bind, defer, drain, scope-widened form a closed reactive system.
-- **Lazy trait values are just values.** The collector doesn't evaluate — Nix laziness resolves thunks on consumer access.
-- **`enterScope` for simple scope entries, explicit drain for complex orchestration.**
+This phase produced the current handler architecture: 37 handler files, narrow effect vocabulary, scope push/pop as explicit effects. This is the architecture that Den 2's stream rebuild proposes to replace — the handler decomposition was the right step for the handler-based model, but the handler model itself is the complexity source.
 
-### Key architectural changes
+---
 
-| Current | After |
-|---------|-------|
-| Walker dispatches to 4 effects based on shape | Walker sends `resolve` for everything |
-| `aspectToEffect` function (recursive dispatch) | `resolve` + `compile` effects (handler-driven) |
-| `compileStatic` function (inline orchestration) | `compile-static` → classify + emit-content + resolve-children effects |
-| Inline `state.modify` in iterate | Named effects: dispatch-policies, record-fired, widen-context |
-| `resolve-schema-entity` monolithic handler | push-scope + resolve + drain + propagate-routes composition |
-| `emit-class` only | Shared `emit-content` dispatching to emit-class or emit-trait |
-| Traits as separate future work | Integrated into emission pipeline design (lazy collection) |
-| `drain-deferred` explicit at 2 sites | Automatic via `scope-widened` for simple cases; explicit `drain` for entity resolution |
+## Phase 8: Pipes and Quirks (Implemented)
 
-### Dependencies
+### Specs
+- `design/pipes-and-quirks.md` — Named data channels with transform stages
 
-- Unified resolve spec can be implemented independently
-- Policy/entity primitives spec depends on unified resolve (uses `resolve` effect)
-- Emission pipeline spec depends on unified resolve (uses `compile-static` and `classify`)
-- Trait implementation depends on emission pipeline spec (uses `emit-content` and `emit-trait`)
+### What was designed
+
+Named data channels (`den.quirks`, later `den.pipes`) with:
+- Producer side: aspects set pipe keys directly (`den.aspects.nginx.firewall = { ports = [...]; }`)
+- Consumer side: class modules receive aggregated pipe data as function args (`{ firewall, ... }:`)
+- Policy-driven transform stages: `pipe.filter`, `pipe.transform`, `pipe.fold`, `pipe.append`, `pipe.for`
+- Cross-host collection: `pipe.collect` with predicate-based sibling harvesting
+- Child-to-parent flow: `pipe.expose`
+- Targeted delivery: `pipe.to`
+- Source tracking: `pipe.withProvenance`
+- Config thunks: pipe values can reference instantiated NixOS config lazily
+
+### What actually shipped
+
+Fully shipped. 753/753 tests (up from 713 pre-pipes). Key implementation files:
+- `nix/lib/aspects/fx/assemble-pipes.nix` (632 lines) — post-pipeline pipe assembly
+- `nix/lib/policy-effects.nix` — pipe effect constructors (`pipe.from`, `pipe.collect`, etc.)
+- `nix/lib/aspects/fx/handlers/bind.nix` — pipe arg detection and deferral
+- `modules/options.nix` — `den.quirks` option (renamed from `den.pipes`)
+
+Key implementation decisions:
+- Pipes are assembled **post-pipeline** in `assemblePipes`, not during the trampoline walk. This is because `pipe.collect` needs sibling visibility (all scopes must be walked before collection).
+- Pipe entries flow through `emit-class` with `__isPipeEntry = true` flag, collected into `scopedClassImports` alongside class modules but NOT wrapped by `wrapClassModule`.
+- Entity-kind filtering in `pipe.collect` is bidirectional: predicate `{ host, ... }:` requires the scope to have `host` AND rejects scopes with extra entity kinds (like `user`).
+- `pipe.expose` uses bottom-up tree walk (`collectAllExposed`) to accumulate child data at parent scope.
+- Config thunks are lazily resolved against instantiated host configs via forward references.
+- `den.quirks` was renamed from `den.pipes` at the option level (commit `aa6677e7`), but the internal type is still "pipe."
+
+### Lasting consequence
+
+Pipes/quirks are the last major feature to ship on the handler-based pipeline. The 632-line `assemblePipes` is the largest single file and the strongest argument for the stream architecture — in the stream model, pipes become ~130 lines of stream combinators + Cycle fixed-point.
+
+The `pipe.collect` entity-kind filtering mechanism (bidirectional matching, routing kind transparency) is architecturally significant — it's replicated in the Den 2 stream spec's pipe.collect sub-design with explicit scope metadata tagging.
+
+---
+
+## Phase 9: Stream Architecture — Den 2 (Proposed)
+
+### Specs
+- `design/stream-architecture-migration.md` — Concern-by-concern analysis mapping current subsystems to stream equivalents
+- `design/den2-stream-rebuild.md` — Target architecture: ~1,400 lines on Ned's stream primitives
+- `design/den2-incremental-delivery.md` — 10-phase parallel-engines delivery plan
+
+### What is proposed
+
+Ground-up rebuild of the resolution engine on [Ned](https://github.com/denful/ned)'s FRP stream primitives. Ned is a ~277-line sibling project using the same nix-effects kernel but with streams as the primitive instead of a handler-based trampoline.
+
+**Core insight:** Den's ~7,300 lines of pipeline infrastructure exist largely because the shared trampoline can't see siblings during a DFS walk. Streams + Cycle.js fixed-point eliminate this entire category of coordination machinery (scope trees, deferred includes, late dispatch, 4-phase post-pipeline assembly).
+
+**Key architectural changes:**
+
+| Current (handler-based) | Proposed (stream-based) |
+|--------------------------|-------------------------|
+| 35+ effect handlers, 22 state fields | ST type + ctxD + Cycle fixed-point |
+| Scope push/pop/widen/defer/drain | ctxD nesting (effect rotation) |
+| Late dispatch (sibling re-visitation) | Eliminated — Cycle gives simultaneous visibility |
+| 4-phase post-pipeline assembly | Eliminated — per-entity streams produce final output |
+| `assemblePipes` (632 lines) | Stream combinators + targeted Cycle (~130 lines) |
+| `wrapClassModule` collision detection | Eliminated — single injection path strips Den args |
+| `den.lib.parametric` wrapping | Eliminated — ctxD handles context propagation automatically |
+
+**Delivery strategy:** Parallel engines. Build `resolve2` alongside the current engine. Both consume the same inputs (`den.aspects`, `den.policies`, `den.hosts`) and produce the same outputs (module lists for `nixosSystem`). Port test suites one phase at a time (10 phases). Delete old engine when all 753 tests pass on the new engine. No flag day.
+
+**Phase ordering:** 0 (foundation) → 1 (aspect resolution) → 2 (parametric) → 3 (policy dispatch) → 4 (forwards) + 5 (custom entities) in parallel → 6 (pipes, depends on 5) → 7 (regressions) → 8 (API changes) → 9 (delete old engine).
+
+### User-facing API changes
+
+7 API improvements (possible because fx-pipeline hasn't shipped):
+1. `den.lib.parametric` eliminated — context propagation automatic
+2. `excludes` as top-level aspect key (replaces buried `meta.handleWith`)
+3. Aspect-scoped policy auto-activation (with opt-out)
+4. Policy effect constructors injected via context (`{ host, include, provide, ... }:`)
+5. `den.quirks` → `den.pipes` (rename)
+6. `den.provides.forward` retired (replaced by `forwardTo` + `policy.route`)
+7. `den.schema` split into `.options` and `.includes`
+
+### What has NOT shipped
+
+Nothing. This is entirely proposed. No code has been written for Den 2 yet. The three specs are the design foundation. Implementation begins at Phase 0.
+
+### Why this supersedes Phase 7's handler decomposition
+
+Phase 7 decomposed the handler architecture into 37 narrow handler files. This was the right step *for the handler model*. But the stream architecture eliminates the handler model entirely — the 37 handlers become ~10 stream combinators and drivers. The narrow effect vocabulary (resolve, compile, gate, bind, defer, drain, push-scope, etc.) is replaced by stream topology (ctxD nesting, flatMap expansion, Cycle fixed-point).
+
+The handler decomposition was valuable as a prerequisite for understanding: it made each concern visible and separable, which made the stream mapping possible. Without Phase 6-7's clarity, the stream architecture analysis could not have identified which concerns are essential vs artifacts of the shared pipeline.
