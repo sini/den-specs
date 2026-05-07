@@ -89,3 +89,4 @@ Track completed runs here:
 | 2026-04-29 | 5 implemented specs | Batch 1 | DLQ, enrichment, flake-scope, forward-elim, compat-shims — all analyzed + SUMMARY.md integrated |
 | (pending) | 10 tbd/vision specs | Batch 2 | unified-aspect-key, class-dedup, provides-removal-post, scope-partitioned, onlyIf-adapter, recursive-aspects-vision, 4× diag |
 | 2026-05-07 | 3 stream architecture specs | Batch 3 | stream-architecture-migration (reference), den2-stream-rebuild (not-implemented), den2-incremental-delivery (not-implemented) — all in design/ with analysis files |
+| 2026-05-07 | 8 implemented-branch specs | Batch 4 | entity-class-eval, scope-partitioned, policy-route, unified-resolve, transition-elim, policy-registry, handler-cleanup, policy-entity — all analyzed + SUMMARY.md integration pending |
