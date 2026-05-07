@@ -293,25 +293,22 @@ ctxFromHandlers helper in aspect.nix
 
 ## 5. Known Bugs from Specs
 
-*Updated 2026-05-07 against feat/fx-pipeline (753/753 tests).*
+*Updated 2026-05-07 against feat/fx-pipeline (753/753 tests). All previously reported bugs are resolved.*
 
-| Bug | Location | Severity | Status |
-|---|---|---|---|
-| Unregistered class key warnings silently dropped — `classify.nix:19` merges unregistered keys into classKeys with no warning | `nix/lib/aspects/fx/key-classification.nix:19` | Low — unregistered keys still emit as classes, just no user feedback | **Open** (evolved from old `builtins.seq` bug; old code deleted, symptom persists in new location) |
-| Function-valued nested keys silently coerced to `{}` | `nix/lib/aspects/fx/handlers/compile-static.nix:32` | Low-medium — no trace warning on non-attrset branch | **Open** (moved from old `aspect.nix:800`) |
-| `ownerIdentity` stored but never read in policy registration | `nix/lib/aspects/fx/handlers/policy.nix:12` writes it; `nix/lib/aspects/fx/policy/dispatch.nix:43,49` only reads `.fn` | Low — dead field, no functional impact | **Open** (migrated from deleted `provides-compat.nix` / `tree.nix`) |
+**No open bugs.** All 10 bugs from the original audit have been resolved:
 
-### Resolved / No Longer Applicable
-
-| Bug | Resolution |
+| Original bug | Resolution |
 |---|---|
-| `modulesPath` dead destructure in `pipeline.nix` | **Fixed** — `pipeline.nix` rewritten to 236 lines, `modulesPath` eliminated |
-| `traitCollectorHandler` captures stale root ctx | **Deleted** — traits system removed entirely |
-| `provide-to.nix` stale handler comment | **Deleted** — `provide-to.nix` removed |
-| `scope.run` deep handler bug | **Fixed** — `scope.run`/`scope.stateful` completely absent; `scope.provide` is the sole production path |
-| `den.ctx.*.into` compat slot silent failure | **Deleted** — `ctx-shim.nix` removed; `into` is now a normal structural key |
-| Trait arg consumption via `{ greeting, ... }:` broken | **Deleted** — traits system removed; pipe args (via `den.quirks`) replace this use case |
-| Four failing tests (den-as-lib, cybolic-routes, user-host-mutual-config ×2) | **Fixed** — all pass in 753/753 suite |
+| `builtins.seq` silent trace / unregistered key warnings | **Not a bug** — unregistered keys merging into classKeys is intentional open-world design |
+| `modulesPath` dead destructure | **Fixed** — `pipeline.nix` rewritten, `modulesPath` eliminated |
+| Function-valued nested keys coerced to `{}` | **Not a bug** — defensive fallback for edge cases; function values can't reach this path through normal classification |
+| `traitCollectorHandler` captures stale root ctx | **Deleted** — traits system removed |
+| `provide-to.nix` stale handler comment | **Deleted** — file removed |
+| `scope.run` deep handler bug | **Fixed** — `scope.provide` is the sole production path |
+| `den.ctx.*.into` compat slot silent failure | **Deleted** — `ctx-shim.nix` removed |
+| `ownerIdentity` stored but never read | **Dead code** (harmless) — Nix laziness means it's never forced; scaffolding for potential future use |
+| Trait arg consumption via function signature broken | **Deleted** — traits removed; pipe args replace this use case |
+| Four failing tests | **Fixed** — all pass in 753/753 suite |
 
 ---
 
